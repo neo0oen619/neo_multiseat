@@ -1,4 +1,3 @@
-
 # Require admin
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
@@ -51,6 +50,44 @@ function Show-FinaleCredits {
     Show-ImportantBanner -Text "Original work and autoupdate credit: https://github.com/asmtron/rdpwrap" -Fg White -Bg DarkBlue
     Show-PurplePulse "made with <3 by neo0oen"
     $script:CreditsShown = $true
+}
+
+# --- RDP file helper (username + timestamp) ---------------------------
+function New-Seat2RdpFile {
+    param([Parameter(Mandatory=$true)][string]$TargetUser)
+
+    # Find primary IPv4 address (skip APIPA and loopback). Fallback to PC name.
+    $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+           Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' } |
+           Select-Object -ExpandProperty IPAddress
+    $primary = $null
+    if ($ips) { $primary = ($ips | Select-Object -First 1) }
+    if (-not $primary) { $primary = $env:COMPUTERNAME }
+
+    # Minimal .rdp for compatibility
+    $content = @"
+full address:s:$primary
+username:s:$TargetUser
+prompt for credentials:i:1
+screen mode id:i:2
+authentication level:i:2
+compression:i:1
+"@
+
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $fileName = "Seat2_{0}_{1}.rdp" -f $TargetUser, $ts
+    $outScript = Join-Path $PSScriptRoot $fileName
+    $outPublic = Join-Path $env:Public ("Desktop\" + $fileName)
+
+    try {
+        $content | Out-File -FilePath $outScript -Encoding ASCII -Force
+        $content | Out-File -FilePath $outPublic -Encoding ASCII -Force
+        Write-Host "Created RDP file(s):" -ForegroundColor Green
+        Write-Host "  $outScript"
+        Write-Host "  $outPublic"
+    } catch {
+        Write-Warning "Could not write .RDP file(s): $($_.Exception.Message)"
+    }
 }
 
 # --- Download helpers (from your fork) --------------------------------
@@ -210,7 +247,6 @@ function Remove-SeatUser {
             $confirm = Read-Host "Type DELETE to remove local user '$chosen'"
             if ($confirm -ne 'DELETE') { Write-Host "Cancelled." ; return }
             try {
-                # Try to remove from group quietly first
                 Remove-LocalGroupMember -Group 'Remote Desktop Users' -Member $chosen -ErrorAction SilentlyContinue
                 Remove-LocalUser -Name $chosen -ErrorAction Stop
                 Write-Host "User '$chosen' deleted."
@@ -346,6 +382,10 @@ function Seat2-InstallFlow {
     param([string]$TargetUser)
 
     Write-Host "=== Installing/Configuring Seat 2 for account: $TargetUser ==="
+
+    # Always create the timestamped RDP file for convenience
+    New-Seat2RdpFile -TargetUser $TargetUser
+
     Install-Or-Update-RDPWrapper
 
     $ok = Enable-RDP-And-Firewall
@@ -411,7 +451,7 @@ function Main-Menu {
                 Open-RDP-Folder
                 continue
             }
-            '^(?i)Q$' { break }
+            '^(?i)(Q|Quit|E|Exit)$' { return }
             default {
                 Write-Warning "Invalid selection. Try again."
                 Start-Sleep -Milliseconds 600
