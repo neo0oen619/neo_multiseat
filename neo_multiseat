@@ -1,0 +1,246 @@
+<# ======================================================================
+    neo_multiseat.ps1  (2025-07-10 build)
+    ---------------------------------------------------------------
+    Turns one Windows 11 Pro PC into a two-seat machine:
+      * Installs TermWrap + RDP Wrapper 1.6.2
+      * Fixes “single session per user” + “max 1 connection” limits
+      * Creates Seat-2 account, enables RDP and firewall rule
+      * Writes helper files (Seat2_Connect.rdp, Activate-Seat2.ps1, etc.)
+====================================================================== #>
+
+param(
+    [string]$SeatUser,
+    [string]$SeatPassword
+)
+
+# ----------------------------------------------------------------------
+# 0.  House-keeping  (transcript + admin check)
+# ----------------------------------------------------------------------
+$ScriptDir = Split-Path -Parent $PSCommandPath
+$logPath   = Join-Path $ScriptDir ("SetupSeat2_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+Start-Transcript -Path $logPath -Append -NoClobber | Out-Null
+function Assert-Admin {
+    if (-not ([Security.Principal.WindowsPrincipal] `
+             [Security.Principal.WindowsIdentity]::GetCurrent() `
+             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Error 'Run this script elevated (Win + X, then **A**).' ; Stop-Transcript ; exit 1
+    }
+}
+Assert-Admin
+Write-Host "Logging to $logPath`n"
+
+# ----------------------------------------------------------------------
+# 1.  Ask for Seat-2 account  (unless supplied on CLI)
+# ----------------------------------------------------------------------
+if ([string]::IsNullOrWhiteSpace($SeatUser)) {
+    do {
+        $SeatUser = Read-Host 'Enter Seat-2 username (must not be empty)'
+    } until (-not [string]::IsNullOrWhiteSpace($SeatUser))
+}
+
+if (-not $SeatPassword) {
+    do {
+        $pw1 = Read-Host "Enter password for $SeatUser" -AsSecureString
+        $pw2 = Read-Host 'Confirm password'           -AsSecureString
+        $plain1 = [Runtime.InteropServices.Marshal]::PtrToStringUni(
+                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw1))
+        $plain2 = [Runtime.InteropServices.Marshal]::PtrToStringUni(
+                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw2))
+        if ($plain1 -ne $plain2)      { Write-Host 'Passwords do not match.' -F Yellow }
+        elseif ($plain1.Length -lt 6) { Write-Host 'Min 6 chars.'           -F Yellow }
+    } until ($plain1 -eq $plain2 -and $plain1.Length -ge 6)
+    $SeatPassword = $plain1
+}
+Write-Host "`n=== Using Seat-2 account: $SeatUser ==="
+
+# ----------------------------------------------------------------------
+# 2.  Install TermWrap via winget  (contains the DLL shim)
+# ----------------------------------------------------------------------
+if (-not (Get-Command winget -EA SilentlyContinue)) {
+    Write-Error 'winget missing – install “App Installer” from Microsoft Store.' ; exit 1
+}
+Write-Host "`n=== Installing TermWrap … ==="
+winget install --id GitHub.llccd.TermWrap -e --accept-package-agreements `
+               --accept-source-agreements | Out-Null
+
+# ----------------------------------------------------------------------
+# 3.  Clean-install RDP Wrapper 1.6.2 + fresh INI
+# ----------------------------------------------------------------------
+$wrapper    = "$env:ProgramFiles\RDP Wrapper"
+$zipFile    = "$env:TEMP\RDPWrap.zip"
+$iniURL     = 'https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap.ini/master/rdpwrap.ini'
+$autoupdateZip = "$env:TEMP\autoupdate_v1.2.zip"
+$autoupdateURL = 'https://github.com/asmtron/rdpwrap/raw/master/autoupdate_v1.2.zip'
+
+
+Write-Host "`n=== Deploying RDP Wrapper 1.6.2 ==="
+Stop-Service UmRdpService,TermService -Force -EA SilentlyContinue
+Remove-Item $wrapper -Recurse -Force -EA SilentlyContinue
+
+Invoke-WebRequest `
+  'https://github.com/stascorp/rdpwrap/releases/download/v1.6.2/RDPWrap-v1.6.2.zip' `
+  -OutFile $zipFile -UseBasicParsing
+Expand-Archive $zipFile -Dest $wrapper -Force ; Remove-Item $zipFile
+
+# install / register the wrapper driver & service
+& (Join-Path $wrapper 'RDPWinst.exe') -i -o
+
+# latest offsets
+Invoke-WebRequest $iniURL -UseBasicParsing -OutFile (Join-Path $wrapper 'rdpwrap.ini')
+
+# ----------------------------------------------------------------------
+# 3.1 Download and extract RDP Wrapper Autoupdate
+# ----------------------------------------------------------------------
+Write-Host "`n=== Downloading and extracting RDP Wrapper Autoupdate ===`n"
+try {
+    Invoke-WebRequest $autoupdateURL -OutFile $autoupdateZip -UseBasicParsing
+    Expand-Archive $autoupdateZip -Dest $wrapper -Force
+    Remove-Item $autoupdateZip
+    Write-Host "RDP Wrapper Autoupdate downloaded and extracted to $wrapper" -ForegroundColor Green
+}
+catch {
+    Write-Warning "Failed to download or extract RDP Wrapper Autoupdate: $($_.Exception.Message)"
+}
+
+
+# ----------------------------------------------------------------------
+# 4.  Remove Microsoft limits (single-session + max connections)
+# ----------------------------------------------------------------------
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+                 -Name fSingleSessionPerUser -Value 0 -Force
+$max = 999999
+'Console','RDP-Tcp' | ForEach-Object {
+    $ws = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\$_"
+    if (Test-Path $ws) { Set-ItemProperty $ws -Name MaxInstanceCount -Value $max -Force }
+}
+# policy hive so GP refresh won’t revert it
+$pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+New-Item $pol -Force | Out-Null
+Set-ItemProperty $pol -Name MaxInstanceCount -Value $max -Force
+
+# ----------------------------------------------------------------------
+# 5.  Enable RDP + start services (make them Auto if they were disabled)
+# ----------------------------------------------------------------------
+Write-Host "`n=== Enabling RDP and starting services ==="
+Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+                 -Name fDenyTSConnections -Value 0
+
+Set-Service TermService -StartupType Automatic -ErrorAction SilentlyContinue
+Set-Service UmRdpService -StartupType Automatic -ErrorAction SilentlyContinue
+
+# Retry service start in case they're still initializing
+for ($i = 0; $i -lt 5; $i++) {
+    try {
+        Start-Service TermService -ErrorAction Stop
+        Start-Service UmRdpService -ErrorAction Stop
+        Write-Host "RDP services started successfully." -ForegroundColor Green
+        break
+    }
+    catch {
+        Write-Warning "Attempt $($i+1): Failed to start RDP services. Retrying in 2 seconds... $($_.Exception.Message)"
+        Start-Sleep -Seconds 2
+    }
+    if ($i -eq 4) {
+        Write-Error "Could not start RDP services after multiple attempts. Please check manually."
+        # Decided not to exit here, as other parts of the script might still be useful.
+    }
+}
+
+
+# firewall
+netsh advfirewall firewall set rule group="remote desktop" new enable=yes | Out-Null
+
+# ----------------------------------------------------------------------
+# 6.  OPTIONAL — schedule auto-update of rdpwrap.ini after every CU
+# ----------------------------------------------------------------------
+Write-Host "`n=== Setting up RDPWrapINI auto-update scheduled task ==="
+# Ensure ScheduledTasks module is loaded
+Import-Module ScheduledTasks -ErrorAction SilentlyContinue
+
+if (-not (Get-ScheduledTask -TaskName 'Update-RDPWrapINI' -EA SilentlyContinue)) {
+    try {
+        $aa = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-WindowStyle Hidden -Command `"Invoke-WebRequest '$iniURL' -OutFile '$wrapper\rdpwrap.ini' -UseBasicParsing`""
+        $tr = New-ScheduledTaskTrigger -AtStartup -RandomDelay 00:05:00
+        Register-ScheduledTask -TaskName 'Update-RDPWrapINI' -Action $aa -Trigger $tr -RunLevel Highest `
+                               -Description 'Refresh rdpwrap.ini after every Windows update'
+        Write-Host "Scheduled task 'Update-RDPWrapINI' created." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to create scheduled task 'Update-RDPWrapINI': $($_.Exception.Message)"
+    }
+} else {
+    Write-Host "Scheduled task 'Update-RDPWrapINI' already exists." -ForegroundColor Cyan
+}
+
+# ----------------------------------------------------------------------
+# 7.  Create or update Seat-2 local account
+# ----------------------------------------------------------------------
+Write-Host "`n=== Creating / updating user $SeatUser ==="
+if (Get-LocalUser -Name $SeatUser -EA SilentlyContinue) {
+    Write-Host "User '$SeatUser' already exists. Updating password and membership."
+    net user $SeatUser $SeatPassword /expires:never /y | Out-Null
+} else {
+    Write-Host "Creating new user '$SeatUser'."
+    net user $SeatUser $SeatPassword /add /expires:never /fullname:"$SeatUser" /y | Out-Null
+}
+Add-LocalGroupMember 'Remote Desktop Users' $SeatUser -EA SilentlyContinue
+Write-Host "User '$SeatUser' added to 'Remote Desktop Users' group." -ForegroundColor Green
+
+# ----------------------------------------------------------------------
+# 8.  Helper files  (RDP shortcut, activator, LAN IP list)
+# ----------------------------------------------------------------------
+Write-Host "`n=== Writing helper files ==="
+$ips = Get-NetIPAddress -AddressFamily IPv4 |
+       Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' } |
+       Select-Object -Expand IPAddress
+($ips -join "`n") | Out-File (Join-Path $ScriptDir 'seat2_RDP_info.txt') -Encoding utf8
+
+$primary = ($ips | Select-Object -First 1)
+@"
+full address:s:$primary
+username:s:$SeatUser
+prompt for credentials:i:1
+screen mode id:i:2
+authentication level:i:2
+compression:i:1
+"@ | Out-File (Join-Path $ScriptDir 'Seat2_Connect.rdp') -Encoding ASCII
+
+$act = Join-Path $ScriptDir 'Activate-Seat2.ps1'
+@"
+param([switch]\$Off)
+function Assert-Admin {
+ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Write-Error 'Run elevated.'; exit 1
+ }
+}
+Assert-Admin
+if (\$Off) {
+  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 1
+  Write-Host 'Seat-2 disabled.'
+} else {
+  Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+  Write-Host 'Seat-2 enabled – press Ctrl+C or run with -Off to close.'
+  while (\$true) { Start-Sleep 60 }
+}
+"@ | Out-File $act -Encoding ASCII
+
+# ----------------------------------------------------------------------
+# 9.  Verify wrapper status – abort if still red
+# ----------------------------------------------------------------------
+Write-Host "`n=== RDP Wrapper diagnostics ==="
+$conf = & (Join-Path $wrapper 'RDPConf.exe') | Tee-Object -Variable conf
+if ($conf -match '\[not supported\]') {
+    Write-Error 'Your Windows build is still unsupported – wait for a newer INI or roll back the latest CU.' ;
+    Stop-Transcript ; exit 1
+}
+Write-Host 'Everything is green – concurrent RDP is ready.' -F Green
+
+# ----------------------------------------------------------------------
+# 10.  Reboot prompt
+# ----------------------------------------------------------------------
+$choice = Read-Host "`nReboot now to finish setup? (Y/N)"
+if ($choice -match '^[Yy]') { Restart-Computer } else {
+    Write-Host "Remember to reboot once before testing Seat 2."
+}
+Stop-Transcript
