@@ -111,7 +111,7 @@ Punchline from the ape: "It just worked — and nobody had to sacrifice a router
 ## Credits 🙌
 
 - **Original work & autoupdate (upstream):** https://github.com/asmtron/rdpwrap  
-- **Your binaries & updates:** pulled from your fork for stability (see this repo).
+- **updates:** pulled from your fork (see this repo).
 
 **Signature:** *made with <3 by neo0oen*
 
