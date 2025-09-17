@@ -17,7 +17,7 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 - **One script, one job** — a clean menu that guides you end‑to‑end.
 - **Pick or create a user** — list existing accounts, reset a password, or add a new one.
-- **Always creates a .RDP file** — named after the chosen user *and* timestamp.
+- **Always creates a `.rdp` file** — named after the chosen user *and* timestamp.
 - **Supports more than two seats** — concurrent sessions for multiple users (people run 3–5 regularly; **10 can be done** on capable hardware/configs).
 - **Works with your fork** — downloads and updates from your repo for stability.
 - **Auto‑updates the good stuff** — fetches updated config after Windows updates.
@@ -42,16 +42,16 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 ## Quick start
 
-1. **Download** the script from this repo’s releases or `scripts/` folder.  
+1. **Download** `neo_multiseat.ps1` from the repo root (or **clone** this repo).  
 2. **Run PowerShell as Administrator**, then:
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\Setup-Seat2-Integrated.ps1
+.\neo_multiseat.ps1
 ```
 
 3. Choose an option:
-   - **Install / Configure Seat 2** (the main event)  
+   - **Install / Configure extra seats** (the main event)  
    - **Fix RDP** (if Windows updates or configs got spicy)  
    - **Delete a user** (with a big "are you sure?")  
    - **Open the RDP folder** (for the curious)
@@ -79,7 +79,7 @@ Tip: You can copy the `.rdp` file to another machine and connect across the netw
 
 ## More than two seats? (Yes.)
 
-- **Create/prepare more users**: run **Install / Configure Seat 2** again and select a different user each time (or press **N** to create new).  
+- **Create/prepare more users**: run **Install / Configure extra seats** again and select a different user each time (or press **N** to create new).  
 - Each run drops a fresh `.rdp` file; hand those to your humans.  
 - Multiple devices can connect **concurrently** to the same PC using different accounts.  
 - **Scaling**: 3–5 sessions is common on modern hardware; **~10 is possible** if CPU/RAM/network keep up and policies allow it. Monitor Task Manager for bottlenecks.
@@ -91,7 +91,7 @@ Tip: You can copy the `.rdp` file to another machine and connect across the netw
 - **"TermService failed to start"**  
   Choose **Fix RDP** in the menu (or accept the "Fix now?" prompt). It will repair things and retry.
 - **RDPConf shows red**  
-  Run the Fix, then Install again. If it’s still red, update the INI via autoupdate and try once more.
+  Run **Fix RDP**, then **Install** again. The script auto‑updates what it needs.
 - **AV blocked something**  
   Check logs and whitelist the RDP Wrapper folder if you trust it.
 - **Still stuck?**  
@@ -101,8 +101,8 @@ Tip: You can copy the `.rdp` file to another machine and connect across the netw
 
 ## Rumor corner: Tailscale 🐒💨
 
-A little bird (okay, an **ape** with suspiciously good Wi‑Fi) whispered that pairing this setup with **Tailscale** makes remote connections feel like a **small tail‑wind**.  
-Punchline from the ape: "It just worked — and I didn’t even have to climb the router." 🍌
+A little bird (okay, an **ape** with suspiciously good Wi‑Fi) whispered that pairing this setup with **Tailscale** makes remote connections feel like a **haunted VPN** — nothing on the router moves, but sessions start walking through walls.  
+Punchline from the ape: "It just worked — and nobody had to sacrifice a router." 🍌
 
 *(Translation: If you want easy, secure remote access across the internet without port‑forwarding, Tailscale can help.)*
 
