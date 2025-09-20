@@ -58,7 +58,7 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 ## Quick start
 
 1. **Download** `neo_multiseat.ps1` from the repo root (or **clone** this repo).  
-2. **Run PowerShell as Administrator**, then:
+2. **Run PowerShell as Administrator**, then run:
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -73,6 +73,15 @@ eo_multiseat.ps1
    - **Open the RDP folder** (for the curious)
 
 When done, **reboot once** before testing the extra seats.
+
+---
+
+## Menu Status
+
+- The banner shows a color‑coded **STATUS** line: **TermService, Port, Wrapper, INI, NLA, TLS, LAN/WAN/TS**, and recent **auth counts**.
+- Colors: **Green** = good, **Yellow** = attention/disabled/disconnected, **Red** = problem.
+  - **WAN**: **Off = Green** (safer); **On = Red** (exposed).
+  - **FAIL** count: **Red when > 0**.
 
 ---
 
@@ -152,8 +161,8 @@ Punchline from the ape: "It just worked — and nobody had to sacrifice a router
 
 ## Credits 🙌
 
-- **Original RDP Wrapper (author):** Stas’M Corp. — https://github.com/stascorp/rdpwrap
-- **Autoupdate fork (updater scripts):** asmtron — https://github.com/asmtron/rdpwrap
+- **Original RDP Wrapper (author):** Stas’M Corp. — https://github.com/stascorp/rdpwrap  
+- **Autoupdate fork (updater scripts):** asmtron — https://github.com/asmtron/rdpwrap  
 - **Updates:** pulled from your fork (see this repo).
 
 **Signature:** *made with <3 by neo0oen*
