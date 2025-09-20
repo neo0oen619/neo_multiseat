@@ -62,8 +62,7 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.
-eo_multiseat.ps1
+.\neo_multiseat.ps1
 ```
 
 3. Choose an option:
