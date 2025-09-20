@@ -162,7 +162,7 @@ Punchline from the ape: "It just worked — and nobody had to sacrifice a router
 
 - **Original RDP Wrapper (author):** Stas’M Corp. — https://github.com/stascorp/rdpwrap  
 - **Autoupdate fork (updater scripts):** asmtron — https://github.com/asmtron/rdpwrap  
-- **Updates:** pulled from your fork (see this repo).
+- **Updates:** pulled from fork - [https://github.com/neo0oen619/neo_multiseat_rdpwrap_backup?tab=readme-ov-file](https://github.com/neo0oen619/neo_multiseat_rdpwrap_backup)
 
 **Signature:** *made with <3 by neo0oen*
 
