@@ -3,7 +3,7 @@
 Turn one Windows PC into a comfy **multi‑seat** workstation — without weird hacks or yak‑shaving.
 Run one PowerShell script, pick a user, and boom: multiple people can use the same machine **at the same time** (via Remote Desktop).
 
-> Heads‑up: Remote Desktop licensing & your company policies still apply. Use this responsibly on systems you own/admin.
+> **Heads‑up:** Remote Desktop licensing & your company policies still apply. Use this responsibly on systems you own/admin.
 
 ---
 
@@ -29,6 +29,21 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 ---
 
+## What’s new (add‑ons)
+
+- **Menu Status line** with color‑coded health: **TermService, Port, Wrapper, INI, NLA, TLS, LAN/WAN/TS**, plus recent **auth counts**.
+  - Colors: **Green** = good, **Yellow** = attention/disabled/disconnected, **Red** = problem.
+  - **WAN**: **Off = Green** (safer); **On = Red** (exposed). **FAIL** count is **Red when > 0**.
+- **Network Modes**: **LAN** (allowlisted subnets), **WAN** (strict CIDRs only — avoid `0.0.0.0/0`), **Tailscale** (auto‑detect adapter), and **Advanced** (NLA+TLS, disable NTLMv1, account lockout, Live Monitor, Tailscale helper).
+- **Live Monitor**: real‑time view of successful/failed logons with quick filters, GUI grid, and CSV export.
+- **Folder layout & files**:
+  - `neo_multiseat.ps1` — main script and menus
+  - `neo_multiseat.net.json` — network modes config (auto‑created)
+  - `neo_multiseat_*.log` — transcript logs per run
+  - `*.rdp` — generated connection files (per user)
+
+---
+
 ## Requirements
 
 - Windows 10/11 **Pro/Enterprise**
@@ -47,7 +62,8 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\neo_multiseat.ps1
+.
+eo_multiseat.ps1
 ```
 
 3. Choose an option:
@@ -73,7 +89,33 @@ When done, **reboot once** before testing the extra seats.
   2. When prompted, enter the password you set in the script for that user.
   3. If you see any warning, read it (responsibly), then continue.
 
-Tip: You can copy the `.rdp` file to another machine and connect across the network (make sure PCs can see each other and ports/firewall are open).
+> Tip: You can copy the `.rdp` file to another machine and connect across the network (make sure PCs can see each other and ports/firewall are open).
+
+---
+
+## Network Modes
+
+- **LAN** — allowlisted local subnets for RDP (default `LocalSubnet`).
+- **WAN** — internet exposure; requires a **strict allowlist** (CIDR/IPs). Avoid `Any/0.0.0.0/0`.
+- **Tailscale** — access via the Tailscale adapter (if present).
+- **Advanced** — NLA+TLS, disable NTLMv1, account lockout, **Live Monitor**, and Tailscale helper.
+
+---
+
+## Live Monitor
+
+- Opens in a new terminal window (**Network Modes → Advanced → [4]**).
+- Controls:
+  - **R** — RDP‑only filter  
+    - Successes: show only `LogonType=10 (RemoteInteractive)`  
+    - Failures: include pre‑auth types **10/7/3** so common RDP failures remain visible
+  - **S** toggle successes (show/hide **4624**)
+  - **K** toggle lockouts (show/hide **4740**)
+  - **+ / -** change days window; **L** list on demand; **E** export CSV; **C** clear; **Q** quit
+  - **G** opens a GUI grid for the current filtered list (select a row for details)
+- Notes:
+  - Listing prints only when pressing **L** (by design); streaming honors filters.
+  - CSV exports are written to the monitor window’s folder.
 
 ---
 
@@ -110,8 +152,9 @@ Punchline from the ape: "It just worked — and nobody had to sacrifice a router
 
 ## Credits 🙌
 
-- **Original work & autoupdate (upstream):** https://github.com/asmtron/rdpwrap  
-- **updates:** pulled from your fork (see this repo).
+- **Original RDP Wrapper (author):** Stas’M Corp. — https://github.com/stascorp/rdpwrap
+- **Autoupdate fork (updater scripts):** asmtron — https://github.com/asmtron/rdpwrap
+- **Updates:** pulled from your fork (see this repo).
 
 **Signature:** *made with <3 by neo0oen*
 
@@ -119,5 +162,5 @@ Punchline from the ape: "It just worked — and nobody had to sacrifice a router
 
 ## License & Disclaimer
 
-- Add a LICENSE file (MIT is common for scripts) if you want others to reuse/fork safely.
+- **License:** See the **LICENSE** file in this repo for terms.
 - **Disclaimer:** This changes how Windows Remote Desktop behaves so multiple people can share the same PC at once. **Use at your own risk.** Ensure you comply with all licenses, policies, and laws. Back up your system. Hydrate. Call your mom.
