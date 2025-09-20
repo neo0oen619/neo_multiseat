@@ -26,9 +26,16 @@ $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13 } catch {}
 
 # --- Logging ----------------------------------------------------------
-$script:LogDir  = Join-Path $PSScriptRoot "."
+$script:LogDir  = Join-Path $PSScriptRoot "logs"
+if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
 $script:LogFile = Join-Path $LogDir ("neo_multiseat_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 Start-Transcript -Path $LogFile -Force | Out-Null
+# Rotate: keep last 25 logs
+try {
+  Get-ChildItem -Path $script:LogDir -Filter 'neo_multiseat_*.log' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip 25 |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
 $host.UI.RawUI.WindowTitle = "neo_multiseat - $(Get-Date -Format 'HH:mm:ss') - logging to $LogFile"
 Write-Host "Logging to $LogFile`n"
 
@@ -58,6 +65,8 @@ $ConfigPath = Join-Path $PSScriptRoot 'neo_multiseat.net.json'
 $RuleLAN    = 'neo_multiseat_RDP_LAN'
 $RuleWAN    = 'neo_multiseat_RDP_WAN'
 $RuleTS     = 'neo_multiseat_RDP_Tailscale'
+$RuleTSBlock= 'neo_multiseat_RDP_Block_Tailscale'
+$RuleBlockAll='neo_multiseat_RDP_Block_All'
 $RdpKey     = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
 
 # Consent mode (null = not chosen yet; 'Auto' runs without prompts; 'Manual' confirms)
@@ -338,11 +347,39 @@ function Show-HealthStrip {
   $tsWorking = $tsEnabled -and $ts.Adapter -and $ts.Has100
   $tsLabel = if ($tsEnabled) { if ($tsWorking) { 'On (working)' } else { 'On (disconnected)' } } else { 'Off (disconnected)' }
 
-  $statusLine = ("STATUS  TermService:{0}  Port:{1}  Wrapper:{2}  INI:{3}  NLA:{4}  TLS:{5}  LAN:{6}  WAN:{7}  TS:{8}  Auth OK:{9} FAIL:{10} (~24h)" -f `
-    $h.TermService, $h.Port, $h.Wrapper, $h.INI, $h.NLA, $h.TLSMode, $lanLabel, $wanLabel, $tsLabel, $h.OK, $h.FAIL)
+  # Color map per item (Green good, Yellow attention, Red problem)
+  $svcColor = if ($h.TermService -eq 'Running') { 'Green' } else { 'Red' }
+  # Wrapper: Partial is a problem (Red), OK is Green
+  $wrapColor = switch ($h.Wrapper) { 'OK' { 'Green' } 'Partial' { 'Red' } default { 'Red' } }
+  $iniColor  = if ($h.INI -eq 'Present') { 'Green' } else { 'Red' }
+  $nlaColor  = if ($h.NLA -eq 'On') { 'Green' } else { 'Yellow' }
+  $tlsColor  = switch ($h.TLSMode) { 'TLS' { 'Green' } 'Negotiate' { 'Yellow' } 'RDP' { 'Red' } default { 'Yellow' } }
+  $lanColor  = if ($lanLabel -eq 'On (working)') { 'Green' } else { 'Yellow' }
+  # WAN: Off (disconnected) is desired (Green). On (enabled) is risky (Red).
+  $wanColor  = if ($wanEnabled) { 'Red' } else { 'Green' }
+  $tsColor   = if ($tsLabel  -eq 'On (working)') { 'Green' } else { 'Yellow' }
+  # Fail logons: any non-zero is Red to draw attention
+  $failColor = if ($h.FAIL -gt 0) { 'Red' } else { 'Green' }
 
   Write-Host ""
-  Write-Host $statusLine -ForegroundColor DarkGreen
+  Write-Host 'STATUS  ' -NoNewline
+  $print = {
+    param($label,$value,$color)
+    $txt = ("{0}:{1}  " -f $label,$value)
+    if ($color) { Write-Host $txt -ForegroundColor $color -NoNewline } else { Write-Host $txt -NoNewline }
+  }
+  & $print 'TermService' $h.TermService $svcColor
+  & $print 'Port'        $h.Port       $null
+  & $print 'Wrapper'     $h.Wrapper    $wrapColor
+  & $print 'INI'         $h.INI        $iniColor
+  & $print 'NLA'         $h.NLA        $nlaColor
+  & $print 'TLS'         $h.TLSMode    $tlsColor
+  & $print 'LAN'         $lanLabel     $lanColor
+  & $print 'WAN'         $wanLabel     $wanColor
+  & $print 'TS'          $tsLabel      $tsColor
+  & $print 'Auth OK'     $h.OK         'Green'
+  & $print 'FAIL'        $h.FAIL       $failColor
+  Write-Host '(~24h)'
 }
 
 # --- RDP file helper (exact username filename) ------------------------
@@ -368,8 +405,9 @@ function New-NeoRdpFile {
   $outPublic = Join-Path $env:Public ("Desktop\" + $fileName)
 
   try {
-    [System.IO.File]::WriteAllText($outScript, $content, [System.Text.ASCIIEncoding]::new())
-    [System.IO.File]::WriteAllText($outPublic, $content, [System.Text.ASCIIEncoding]::new())
+    $ascii = [System.Text.Encoding]::ASCII
+    [System.IO.File]::WriteAllText($outScript, $content, $ascii)
+    [System.IO.File]::WriteAllText($outPublic, $content, $ascii)
     Write-Host "Created RDP file(s):" -ForegroundColor Green
     Write-Host "  $outScript"
     Write-Host "  $outPublic"
@@ -561,7 +599,8 @@ function Enable-RDP-And-Firewall {
   $preview = @(
     "Registry flip: Enable RDP connections",
     "Policy keys: allow multiple sessions / raise instance cap",
-    "Firewall: enable built-in Remote Desktop group"
+    "Firewall: disable Windows 'Remote Desktop' group; use neo rules",
+    "Firewall: enable neo_multiseat LAN rule by default (LocalSubnet)"
   )
   $gui = "Settings > System > Remote Desktop > Enable"
   $cli = @(
@@ -569,15 +608,21 @@ function Enable-RDP-And-Firewall {
     'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f',
     'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f',
     'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxInstanceCount /t REG_DWORD /d 999999 /f',
-    'netsh advfirewall firewall set rule group="remote desktop" new enable=yes'
+    'netsh advfirewall firewall set rule group="remote desktop" new enable=no'
   )
   Confirm-Apply -Title "Enable RDP & policy keys" -PreviewLines $preview -ManualGui $gui -ManualCli $cli -Action {
     reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
     reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f | Out-Null
     reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f | Out-Null
     reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxInstanceCount /t REG_DWORD /d 999999 /f | Out-Null
-    try { Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Out-Null }
-    catch { netsh advfirewall firewall set rule group="remote desktop" new enable=yes | Out-Null }
+    # Always disable Windows built-in RDP group; we manage access via neo rules
+    try { Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Out-Null }
+    catch { netsh advfirewall firewall set rule group="remote desktop" new enable=no | Out-Null }
+
+    # Ensure our rules exist, use the current RDP port, and default to LAN On (LocalSubnet)
+    Align-NeoFirewallRules
+    Sync-BlockRules
+    try { Enable-NetFirewallRule -DisplayName $RuleLAN -ErrorAction Stop | Out-Null } catch {}
   }
 
   $svc = 'TermService'
@@ -688,7 +733,11 @@ function Load-NetConfig {
     LAN = @{ Enabled = $false; Allowlist = @("LocalSubnet") }
     WAN = @{ Enabled = $false; Allowlist = @() }
     TS  = @{ Enabled = $false }
-    Security = @{ NLA = $false; NTLMv1Disabled = $false; LockoutPolicy = $false }
+    Security = @{ 
+      NLA = $false; NTLMv1Disabled = $false; LockoutPolicy = $false;
+      MonitorSilent = $false; MonitorThreshold = 5; MonitorWindowSec = 60;
+      AlertOnBurst = $true; AlertOnLockout = $true; AutoPopMonitor = $true 
+    }
   }
 }
 function Save-NetConfig($cfg) { $cfg | ConvertTo-Json -Depth 6 | Out-File -FilePath $ConfigPath -Encoding UTF8 -Force }
@@ -696,7 +745,7 @@ function Save-NetConfig($cfg) { $cfg | ConvertTo-Json -Depth 6 | Out-File -FileP
 function Ensure-NeoFirewallRules {
   if (-not (Get-NetFirewallRule -DisplayName $RuleLAN -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $RuleLAN -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow `
-      -RemoteAddress LocalSubnet -Service TermService -Profile Domain,Private -Enabled False | Out-Null
+      -RemoteAddress LocalSubnet -Service TermService -Profile Any -Enabled False | Out-Null
   }
   if (-not (Get-NetFirewallRule -DisplayName $RuleWAN -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $RuleWAN -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow `
@@ -705,6 +754,111 @@ function Ensure-NeoFirewallRules {
   if (-not (Get-NetFirewallRule -DisplayName $RuleTS -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $RuleTS -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow `
       -InterfaceAlias "Tailscale*" -Service TermService -Profile Any -Enabled False | Out-Null
+  }
+  # Block rules (disabled by default)
+  if (-not (Get-NetFirewallRule -DisplayName $RuleTSBlock -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName $RuleTSBlock -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Block `
+      -InterfaceAlias "Tailscale*" -Profile Any -Enabled False | Out-Null
+  }
+  if (-not (Get-NetFirewallRule -DisplayName $RuleBlockAll -ErrorAction SilentlyContinue)) {
+    New-NetFirewallRule -DisplayName $RuleBlockAll -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Block `
+      -RemoteAddress Any -Profile Any -Enabled False | Out-Null
+  }
+}
+
+# Disable the built-in Windows firewall group for RDP so our rules control access
+function Disable-BaseRdpFirewallRules {
+  try { Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Out-Null }
+  catch { netsh advfirewall firewall set rule group="remote desktop" new enable=no | Out-Null }
+}
+
+# Ensure neo rules use the active RDP port and correct profiles
+function Get-RdpPort {
+  $port = 3389
+  try {
+    $pn = (Get-ItemProperty -Path $RdpKey -Name PortNumber -ErrorAction SilentlyContinue).PortNumber
+    if ($pn) { $port = [int]$pn }
+  } catch {}
+  return $port
+}
+
+function Ensure-NeoRuleProfiles {
+  try { Set-NetFirewallRule -DisplayName $RuleLAN -Profile Any | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleWAN -Profile Any | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleTS  -Profile Any | Out-Null } catch {}
+}
+
+function Ensure-NeoRulePorts {
+  $p = Get-RdpPort
+  try { Set-NetFirewallRule -DisplayName $RuleLAN | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $p | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleWAN | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $p | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleTS  | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $p | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleTSBlock | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $p | Out-Null } catch {}
+  try { Set-NetFirewallRule -DisplayName $RuleBlockAll | Set-NetFirewallPortFilter -Protocol TCP -LocalPort $p | Out-Null } catch {}
+}
+
+function Align-NeoFirewallRules {
+  Ensure-NeoFirewallRules
+  Ensure-NeoRuleProfiles
+  Ensure-NeoRulePorts
+}
+
+# Enable/disable block rules based on current desired state
+function Sync-BlockRules {
+  $cfg = Load-NetConfig
+  # Tailscale block is enabled when TS is Off
+  try {
+    if ($cfg.TS.Enabled) { Disable-NetFirewallRule -DisplayName $RuleTSBlock -ErrorAction SilentlyContinue | Out-Null }
+    else { Enable-NetFirewallRule -DisplayName $RuleTSBlock -ErrorAction SilentlyContinue | Out-Null }
+  } catch {}
+  # Global block-all is enabled when all three are Off
+  $anyOn = ($cfg.LAN.Enabled -or $cfg.WAN.Enabled -or $cfg.TS.Enabled)
+  try {
+    if ($anyOn) { Disable-NetFirewallRule -DisplayName $RuleBlockAll -ErrorAction SilentlyContinue | Out-Null }
+    else { Enable-NetFirewallRule -DisplayName $RuleBlockAll -ErrorAction SilentlyContinue | Out-Null }
+  } catch {}
+}
+
+# Find any other inbound allow rules that would permit RDP (TCP 3389 or TermService)
+function Get-NonNeoRdpAllowRules {
+  $ours = @($RuleLAN,$RuleWAN,$RuleTS)
+  $candidates = @()
+  try {
+    $rules = Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -ErrorAction SilentlyContinue
+    foreach ($r in $rules) {
+      if ($r.DisplayName -in $ours) { continue }
+      $isRdp = $false
+      try {
+        $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue
+        if ($pf) {
+          $proto = $pf.Protocol
+          $lport = $pf.LocalPort
+          if ($proto -eq 'TCP' -and $lport) {
+            if ($lport -is [array]) { if ($lport -contains 3389 -or $lport -contains '3389') { $isRdp = $true } }
+            else { if ($lport -eq 3389 -or $lport -eq '3389') { $isRdp = $true } }
+          }
+        }
+      } catch {}
+      if (-not $isRdp) {
+        try {
+          $sf = Get-NetFirewallServiceFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue
+          if ($sf -and ($sf.Service -match 'TermService')) { $isRdp = $true }
+        } catch {}
+      }
+      if (-not $isRdp) {
+        # As a fallback, treat any rule in the built-in group as RDP
+        if ($r.DisplayGroup -eq 'Remote Desktop') { $isRdp = $true }
+      }
+      if ($isRdp) { $candidates += $r }
+    }
+  } catch {}
+  return $candidates
+}
+
+function Quarantine-ConflictingRdpRules {
+  $others = Get-NonNeoRdpAllowRules
+  foreach ($r in $others) {
+    try { Disable-NetFirewallRule -Name $r.Name -ErrorAction SilentlyContinue | Out-Null } catch {}
   }
 }
 
@@ -738,62 +892,45 @@ function Reconcile-NetConfig {
 
 function Show-NetModesStatus {
   Ensure-NeoFirewallRules
-  Reconcile-NetConfig
-  $cfg = Load-NetConfig
-
-  $lanR = Get-NetFirewallRule -DisplayName $RuleLAN -ErrorAction SilentlyContinue
-  $wanR = Get-NetFirewallRule -DisplayName $RuleWAN -ErrorAction SilentlyContinue
-  $tsR  = Get-NetFirewallRule -DisplayName $RuleTS  -ErrorAction SilentlyContinue
-
-  $lanEnabled = ($lanR -and $lanR.Enabled -eq 'True')
-  $wanEnabled = ($wanR -and $wanR.Enabled -eq 'True')
-  $tsEnabled  = ($tsR  -and $tsR.Enabled  -eq 'True')
-
-  $lanAddr = $null
-  $wanAddr = $null
-  try { $lanAddr = (Get-NetFirewallRule -DisplayName $RuleLAN | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue).RemoteAddress } catch {}
-  try { $wanAddr = (Get-NetFirewallRule -DisplayName $RuleWAN | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue).RemoteAddress } catch {}
-
-  $lanAllow = if ($lanAddr) { $lanAddr -join ', ' } else { 'LocalSubnet' }
-  $wanAllow = if ($wanAddr) { $wanAddr -join ', ' } else { '<empty>' }
-
-  $lanLabel = if ($lanEnabled) { "On (working)" } else { "Off (disconnected)" }
-  $wanLabel = if ($wanEnabled) { "On (working)" } else { "Off (disconnected)" }
-
-  $lanColor = if ($lanEnabled) { 'Green' } else { 'DarkGray' }
-  $wanColor = if ($wanEnabled) { 'Green' } else { 'DarkGray' }
-
-  $ts = Get-TailscaleStatus
-  $tsAdapterName = if ($ts.Adapter) { $ts.Adapter.Name } else { 'not detected' }
-  $tsWorking = $tsEnabled -and $ts.Adapter -and $ts.Has100
-  $tsLabel = if ($tsEnabled) { if ($tsWorking) { 'On (working)' } else { 'On (disconnected)' } } else { 'Off (disconnected)' }
-  $tsColor = if ($tsEnabled -and $tsWorking) { 'Green' } else { 'DarkGray' }
-
-  Write-Host ""
-  Write-Host "=== Network access modes ===" -ForegroundColor Cyan
-  Write-Host ("LAN:       {0}    allowlist: {1}" -f $lanLabel, $lanAllow) -ForegroundColor $lanColor
-  Write-Host ("WAN:       {0}    allowlist: {1}" -f $wanLabel, $wanAllow) -ForegroundColor $wanColor
-  Write-Host ("Tailscale: {0}    adapter: {1}, 100.x: {2}" -f $tsLabel, $tsAdapterName, $(if($ts.Has100){'Yes'}else{'No'})) -ForegroundColor $tsColor
+  # Fast, cached status rendering
+  Show-NetModesStatusCached
 }
 
 function Set-WAN-Allowlist { param([string[]]$Cidrs)
   if (-not $Cidrs -or -not $Cidrs.Count) { throw "WAN allowlist cannot be empty." }
+  if (-not (Test-WAN-AllowlistSafe $Cidrs)) { throw "WAN allowlist too broad. Avoid Any/0.0.0.0/0." }
   Set-NetFirewallRule -DisplayName $RuleWAN | Set-NetFirewallAddressFilter -RemoteAddress ($Cidrs -join ",") | Out-Null
   $cfg = Load-NetConfig; $cfg.WAN.Allowlist = $Cidrs; Save-NetConfig $cfg
+  Refresh-NetModesCache -Force
 }
 function Set-LAN-Allowlist { param([string[]]$Cidrs)
   if (-not $Cidrs -or -not $Cidrs.Count) { throw "LAN allowlist cannot be empty." }
   Set-NetFirewallRule -DisplayName $RuleLAN | Set-NetFirewallAddressFilter -RemoteAddress ($Cidrs -join ",") | Out-Null
   $cfg = Load-NetConfig; $cfg.LAN.Allowlist = $Cidrs; Save-NetConfig $cfg
+  Refresh-NetModesCache -Force
 }
 
 function Toggle-Mode {
   param([ValidateSet('LAN','WAN','TS')][string]$Mode, [bool]$Enabled)
+  # Ensure Windows built-in RDP group is disabled so toggles are authoritative
+  Disable-BaseRdpFirewallRules
+  Align-NeoFirewallRules
+  Quarantine-ConflictingRdpRules
+  if ($Mode -eq 'WAN' -and $Enabled) {
+    $cfg = Load-NetConfig
+    if (-not (Test-WAN-AllowlistSafe $cfg.WAN.Allowlist)) {
+      Write-Host 'Refusing to enable WAN: allowlist must contain specific CIDR/IP (not Any/0.0.0.0/0).' -ForegroundColor Red
+      Write-Host 'Set a WAN allowlist first (menu 5 -> option 5).' -ForegroundColor Yellow
+      return
+    }
+  }
   $name = switch($Mode){ 'LAN'{$RuleLAN} 'WAN'{$RuleWAN} 'TS'{$RuleTS} }
   if ($Enabled) { Enable-NetFirewallRule -DisplayName $name | Out-Null } else { Disable-NetFirewallRule -DisplayName $name | Out-Null }
   $cfg = Load-NetConfig
   switch($Mode){ 'LAN' { $cfg.LAN.Enabled = $Enabled } 'WAN' { $cfg.WAN.Enabled = $Enabled } 'TS' { $cfg.TS.Enabled = $Enabled } }
   Save-NetConfig $cfg
+  Refresh-NetModesCache -Force
+  Sync-BlockRules
 }
 
 function Input-CIDRs { param([string]$Prompt)
@@ -803,9 +940,112 @@ function Input-CIDRs { param([string]$Prompt)
   return $arr
 }
 
+function Test-WAN-AllowlistSafe { param([string[]]$Cidrs)
+  if (-not $Cidrs -or -not $Cidrs.Count) { return $false }
+  $unsafe = @('any','*','0.0.0.0','0.0.0.0/0','::/0')
+  foreach ($c in $Cidrs) {
+    $norm = ($c.Trim()).ToLower()
+    if ($unsafe -contains $norm) { return $false }
+  }
+  return $true
+}
+
 # Live monitor and security tools --------------------------------------
+# --- Cached status for faster menu 5 -----------------------------------
+$script:NeoNetCache = [PSCustomObject]@{
+  LastRefreshed = Get-Date '2000-01-01'
+  BaseOn = $false
+  Conflicts = 0
+  LAN = @{ Enabled=$false; Allowlist='LocalSubnet' }
+  WAN = @{ Enabled=$false; Allowlist='' }
+  TS  = @{ Enabled=$false; Adapter='not detected'; Has100=$false }
+}
+
+function Refresh-NetModesCache { param([switch]$Force)
+  $minInterval = [TimeSpan]::FromSeconds(2)
+  $now = Get-Date
+  if (-not $Force -and ($now - $script:NeoNetCache.LastRefreshed) -lt $minInterval) { return }
+
+  $cfg = Load-NetConfig
+  $lanR = Get-NetFirewallRule -DisplayName $RuleLAN -ErrorAction SilentlyContinue
+  $wanR = Get-NetFirewallRule -DisplayName $RuleWAN -ErrorAction SilentlyContinue
+  $tsR  = Get-NetFirewallRule -DisplayName $RuleTS  -ErrorAction SilentlyContinue
+
+  $script:NeoNetCache.LAN.Enabled = ($lanR -and $lanR.Enabled -eq 'True')
+  $script:NeoNetCache.WAN.Enabled = ($wanR -and $wanR.Enabled -eq 'True')
+  $script:NeoNetCache.TS.Enabled  = ($tsR  -and $tsR.Enabled  -eq 'True')
+
+  # Use our JSON config as the source of truth for allowlists (fast)
+  $script:NeoNetCache.LAN.Allowlist = if ($cfg.LAN.Allowlist -and $cfg.LAN.Allowlist.Count) { ($cfg.LAN.Allowlist -join ', ') } else { 'LocalSubnet' }
+  $script:NeoNetCache.WAN.Allowlist = if ($cfg.WAN.Allowlist -and $cfg.WAN.Allowlist.Count) { ($cfg.WAN.Allowlist -join ', ') } else { '<empty>' }
+
+  # Base Windows group state
+  $baseOn = $false
+  try { $baseOn = (Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' }).Count -gt 0 } catch {}
+  $script:NeoNetCache.BaseOn = $baseOn
+
+  # Conflicts check skipped by default for speed; quarantined on toggles
+  $script:NeoNetCache.Conflicts = 0
+
+  # Tailscale status (quick)
+  $ts = Get-TailscaleStatus
+  $script:NeoNetCache.TS.Adapter = if ($ts.Adapter) { $ts.Adapter.Name } else { 'not detected' }
+  $script:NeoNetCache.TS.Has100  = $ts.Has100
+
+  $script:NeoNetCache.LastRefreshed = $now
+}
+
+function Show-NetModesStatusCached {
+  Refresh-NetModesCache
+  $lanEnabled = $script:NeoNetCache.LAN.Enabled
+  $wanEnabled = $script:NeoNetCache.WAN.Enabled
+  $tsEnabled  = $script:NeoNetCache.TS.Enabled
+  $lanAllow = $script:NeoNetCache.LAN.Allowlist
+  $wanAllow = $script:NeoNetCache.WAN.Allowlist
+  $tsAdapterName = $script:NeoNetCache.TS.Adapter
+  $tsHas100 = $script:NeoNetCache.TS.Has100
+
+  $lanLabel = if ($lanEnabled) { 'On (working)' } else { 'Off (disconnected)' }
+  $wanLabel = if ($wanEnabled) { 'On (working)' } else { 'Off (disconnected)' }
+  $lanColor = if ($lanEnabled) { 'Green' } else { 'DarkGray' }
+  $wanColor = if ($wanEnabled) { 'Green' } else { 'DarkGray' }
+  $tsWorking = $tsEnabled -and ($tsAdapterName -ne 'not detected') -and $tsHas100
+  $tsLabel = if ($tsEnabled) { if ($tsWorking) { 'On (working)' } else { 'On (disconnected)' } } else { 'Off (disconnected)' }
+  $tsColor = if ($tsEnabled -and $tsWorking) { 'Green' } else { 'DarkGray' }
+
+  Write-Host ''
+  Write-Host '=== Network access modes ===' -ForegroundColor Cyan
+  if ($script:NeoNetCache.BaseOn) { Write-Host 'Windows RDP group: Enabled (overrides neo rules)' -ForegroundColor Red } else { Write-Host 'Windows RDP group: Disabled (neo rules in control)' -ForegroundColor DarkGray }
+  # Conflicts are quarantined automatically when toggles run; full scan omitted for speed
+  Write-Host ("LAN:       {0}    allowlist: {1}" -f $lanLabel, $lanAllow) -ForegroundColor $lanColor
+  Write-Host ("WAN:       {0}    allowlist: {1}" -f $wanLabel, $wanAllow) -ForegroundColor $wanColor
+  Write-Host ("Tailscale: {0}    adapter: {1}, 100.x: {2}" -f $tsLabel, $tsAdapterName, $(if($tsHas100){'Yes'}else{'No'})) -ForegroundColor $tsColor
+}
+
+# Auto-pop monitor if triggered (burst or lockout) and allowed by config
+function Start-MonitorIfTriggered {
+  try {
+    $cfg = Load-NetConfig
+    if (-not $cfg -or -not $cfg.Security) { return }
+    if (-not $cfg.Security.AutoPopMonitor) { return }
+    if ($cfg.Security.MonitorSilent) { return }
+    $win = [int]$cfg.Security.MonitorWindowSec; if ($win -le 0) { $win = 60 }
+    $thr = [int]$cfg.Security.MonitorThreshold; if ($thr -le 0) { $thr = 5 }
+    $since = (Get-Date).AddSeconds(-$win)
+    $fails = @(Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625; StartTime=$since} -MaxEvents 200 -ErrorAction SilentlyContinue).Count
+    $hasLock = @(Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4740; StartTime=$since} -MaxEvents 50 -ErrorAction SilentlyContinue).Count -gt 0
+    $should = ($cfg.Security.AlertOnBurst -and ($fails -ge $thr)) -or ($cfg.Security.AlertOnLockout -and $hasLock)
+    if (-not $should) { return }
+    $lock = Join-Path $script:LogDir 'neo_monitor.lock'
+    if (Test-Path $lock) {
+      $age = (Get-Date) - (Get-Item $lock).LastWriteTime
+      if ($age.TotalMinutes -lt 5) { return }
+    }
+    Start-LiveMonitorWindow
+  } catch {}
+}
 function Get-4625Reason { param([string]$Status,[string]$Sub)
-  $s = ($Status|ToUpper); $u = ($Sub|ToUpper)
+  $s = ("$Status").ToUpper(); $u = ("$Sub").ToUpper()
   if ($u -eq '0XC000006A') { return 'Bad password' }
   if ($u -eq '0XC0000064') { return 'User does not exist' }
   if ($u -eq '0XC0000234') { return 'Account locked out' }
@@ -824,17 +1064,88 @@ function Get-4625Reason { param([string]$Status,[string]$Sub)
 
 function Start-BruteforceMonitor {
   Write-Host ""
-  Show-ImportantBanner -Text "Brute-force monitor (Security 4625 / 4740). Press Q to quit." -Fg Black -Bg Yellow
+  Show-ImportantBanner -Text "Live auth monitor (4625 fails / 4740 lockouts). Q=quit, S=summary, C=clear, P=paged" -Fg Black -Bg Yellow
   $since = (Get-Date).AddSeconds(-5)
 
   $windowSec = 60
   $burstThreshold = 5
-  $seen = @{} # ip -> [DateTime[]]
+  $byIp = @{}      # ip -> [DateTime[]]
+  $byUser = @{}    # user -> [DateTime[]]
+  $recent = New-Object System.Collections.ArrayList  # rolling recent lines
+  $summaryOnly = $false
+
+  function Add-ToMap([hashtable]$map,[string]$key,[datetime]$ts){
+    if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.ArrayList }
+    [void]$map[$key].Add($ts)
+    $cut=(Get-Date).AddSeconds(-$windowSec)
+    $keep = New-Object System.Collections.ArrayList
+    foreach($t in $map[$key]){ if($t -gt $cut){ [void]$keep.Add($t) } }
+    $map[$key]=$keep
+  }
+
+  function Top5($map){
+    $rows=@()
+    foreach($k in $map.Keys){ $rows += [PSCustomObject]@{ Key=$k; Count=$map[$k].Count; Last= ($map[$k] | Sort-Object -Descending | Select-Object -First 1) } }
+    $rows | Where-Object { $_.Count -gt 0 } |
+      Sort-Object -Property @{Expression='Count';Descending=$true}, @{Expression='Last';Descending=$true} |
+      Select-Object -First 5
+  }
+
+  function Print-Summary(){
+    Write-Host ""; Write-Host "Top IPs (last $windowSec s):" -ForegroundColor Cyan
+    $topIp = Top5 $byIp
+    if ($topIp){ foreach($r in $topIp){ Write-Host ("  {0,3}  {1,-18}  last {2:HH:mm:ss}" -f $r.Count,$r.Key,$r.Last) -ForegroundColor Red } } else { Write-Host "  (none)" -ForegroundColor DarkGray }
+    Write-Host "Top Users (last $windowSec s):" -ForegroundColor Cyan
+    $topUser = Top5 $byUser
+    if ($topUser){ foreach($r in $topUser){ Write-Host ("  {0,3}  {1}" -f $r.Count,$r.Key) -ForegroundColor Yellow } } else { Write-Host "  (none)" -ForegroundColor DarkGray }
+  }
+
+  function Load-4625Paged([int]$Max=5000){
+    $items = @()
+    try {
+      $evts = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625} -MaxEvents $Max -ErrorAction SilentlyContinue
+      foreach($e in $evts){
+        try{
+          $xml=[xml]$e.ToXml(); $data=@{}; foreach($d in $xml.Event.EventData.Data){ $data[$d.Name]=$d.'#text' }
+          $ip=$data['IpAddress']; if(-not $ip){$ip='-'}
+          $user=$data['TargetUserName']; $work=$data['WorkstationName']
+          $st=$data['Status']; $sub=$data['SubStatus']; $reason=Get-4625Reason -Status $st -Sub $sub
+          $items += [PSCustomObject]@{ Time=$e.TimeCreated; User=$user; IP=$ip; Workstation=$work; Reason=$reason; Status=$st; SubStatus=$sub }
+        }catch{}
+      }
+    }catch{}
+    # Newest first
+    return ($items | Sort-Object Time -Descending)
+  }
+
+  function Show-Paged([object[]]$items,[int]$PageSize=100){
+    if(-not $items -or $items.Count -eq 0){ Write-Host 'No failed logons found.' -ForegroundColor DarkGray; return }
+    $total=$items.Count; $pages=[math]::Ceiling($total/[double]$PageSize)
+    $pi=0
+    while($true){
+      Clear-Host
+      Show-ImportantBanner -Text ("4625 failed logons (page {0}/{1}, newest first). N=next, B=back, R=reload, Q=quit" -f ($pi+1),$pages) -Fg Black -Bg Yellow
+      $start=$pi*$PageSize
+      $slice=$items[$start..([math]::Min($start+$PageSize-1,$total-1))]
+      '{0,-10}  {1,-20}  {2,-18}  {3,-10}  {4}' -f 'Time','User','IP','Status','Reason' | Write-Host -ForegroundColor Cyan
+      foreach($it in $slice){
+        '{0:HH:mm:ss}   {1,-20}  {2,-18}  {3,-10}  {4}' -f $it.Time,$it.User,$it.IP,$it.Status,$it.Reason | Write-Host -ForegroundColor Red
+      }
+      $k=[Console]::ReadKey($true)
+      if($k.Key -eq 'Q'){ break }
+      elseif($k.Key -eq 'N'){ if($pi -lt ($pages-1)){ $pi++ } }
+      elseif($k.Key -eq 'B'){ if($pi -gt 0){ $pi-- } }
+      elseif($k.Key -eq 'R'){ $items=Load-4625Paged $items.Count; $total=$items.Count; $pages=[math]::Ceiling($total/[double]$PageSize); if($pi -ge $pages){$pi=[math]::Max(0,$pages-1)} }
+    }
+  }
 
   while ($true) {
     while ([Console]::KeyAvailable) {
       $k = [Console]::ReadKey($true)
       if ($k.Key -eq 'Q') { return }
+      if ($k.Key -eq 'S') { $summaryOnly = -not $summaryOnly }
+      if ($k.Key -eq 'C') { $byIp=@{}; $byUser=@{}; $recent=New-Object System.Collections.ArrayList; Clear-Host; Show-ImportantBanner -Text "Live auth monitor (4625 fails / 4740 lockouts). Q=quit, S=summary, C=clear, P=paged" -Fg Black -Bg Yellow }
+      if ($k.Key -eq 'P') { $data=Load-4625Paged 5000; Show-Paged -items $data -PageSize 100; Clear-Host; Show-ImportantBanner -Text "Live auth monitor (4625 fails / 4740 lockouts). Q=quit, S=summary, C=clear, P=paged" -Fg Black -Bg Yellow; $since=(Get-Date).AddSeconds(-5) }
     }
     try {
       $events4625 = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625; StartTime=$since} -ErrorAction SilentlyContinue
@@ -846,30 +1157,20 @@ function Start-BruteforceMonitor {
           $ip = $data['IpAddress']; if (-not $ip) { $ip = '-' }
           $user = $data['TargetUserName']
           $work = $data['WorkstationName']
-          $lt   = $data['LogonType']
           $st   = $data['Status']
           $sub  = $data['SubStatus']
           $reason = Get-4625Reason -Status $st -Sub $sub
 
-          if ($ip -and $ip -ne '-' -and $ip -ne '::1') {
-            if (-not $seen.ContainsKey($ip)) { $seen[$ip] = New-Object System.Collections.ArrayList }
-            [void]$seen[$ip].Add($e.TimeCreated)
-            $cut = (Get-Date).AddSeconds(-$windowSec)
-            $toKeep = New-Object System.Collections.ArrayList
-            foreach ($t in $seen[$ip]) { if ($t -gt $cut) { [void]$toKeep.Add($t) } }
-            $seen[$ip] = $toKeep
-            $count = $seen[$ip].Count
-            if ($count -ge $burstThreshold) {
-              try { [Console]::Beep(900,180) } catch {}
-              Write-Host ("*** BURST {0} failures in {1}s from {2} ***" -f $count,$windowSec,$ip) -ForegroundColor Red
-            }
-          }
+          if ($ip -and $ip -ne '-' -and $ip -ne '::1') { Add-ToMap $byIp $ip $e.TimeCreated }
+          if ($user) { Add-ToMap $byUser $user $e.TimeCreated }
 
-          Write-Host ("[{0:HH:mm:ss}] 4625 {1}@{2}  {3}  (Status {4}/{5})  LT={6}  WS={7}" `
-            -f $e.TimeCreated, $user, $ip, $reason, $st, $sub, $lt, $work) -ForegroundColor Red
-        } catch {
-          Write-Host ("Monitor decode error: " + $_.Exception.Message) -ForegroundColor DarkRed
-        }
+          $line = "[{0:HH:mm:ss}] FAIL  {1}@{2}  {3}  ({4}/{5})" -f $e.TimeCreated, $user, $ip, $reason, $st, $sub
+          if (-not $summaryOnly) { Write-Host $line -ForegroundColor Red }
+          try {
+            $count = if($ip -and $byIp.ContainsKey($ip)) { $byIp[$ip].Count } else { 0 }
+            if ($count -ge $burstThreshold) { try { [Console]::Beep(900,180) } catch {} }
+          } catch {}
+        } catch { Write-Host ("Monitor decode error: " + $_.Exception.Message) -ForegroundColor DarkRed }
       }
 
       $events4740 = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4740; StartTime=$since} -ErrorAction SilentlyContinue
@@ -881,18 +1182,280 @@ function Start-BruteforceMonitor {
           $tuser  = $data['TargetUserName']
           $caller = $data['CallerComputerName']
           try { [Console]::Beep(600,200) } catch {}
-          Write-Host ("[{0:HH:mm:ss}] 4740 LOCKOUT  user={1}  caller={2}" -f $e.TimeCreated, $tuser, $caller) -ForegroundColor Yellow
-        } catch {
-          Write-Host ("Monitor decode error (4740): " + $_.Exception.Message) -ForegroundColor DarkRed
-        }
+          $line = "[{0:HH:mm:ss}] LOCK  user={1}  caller={2}" -f $e.TimeCreated, $tuser, $caller
+          if (-not $summaryOnly) { Write-Host $line -ForegroundColor Yellow }
+        } catch { Write-Host ("Monitor decode error (4740): " + $_.Exception.Message) -ForegroundColor DarkRed }
       }
 
+      if ($summaryOnly) { Print-Summary }
       $since = Get-Date
-    } catch {
-      Write-Host ("Monitor error: " + $_.Exception.Message) -ForegroundColor DarkRed
-    }
-    Start-Sleep -Milliseconds 800
+    } catch { Write-Host ("Monitor error: " + $_.Exception.Message) -ForegroundColor DarkRed }
+    Start-Sleep -Milliseconds 700
   }
+}
+
+# --- Monitor in new window (alerting) ---------------------------------
+function Start-LiveMonitorWindow {
+  $tmp = Join-Path $env:TEMP ("neo_live_monitor_{0:yyyyMMdd_HHmmss}.ps1" -f (Get-Date))
+  $script = @'
+$ErrorActionPreference = "Continue"
+try { $host.UI.RawUI.WindowTitle = 'neo_multiseat live logon monitor' } catch {}
+
+function Get-4625Reason { param([string]$Status,[string]$Sub)
+  $s = ("$Status").ToUpper(); $u = ("$Sub").ToUpper()
+  if ($u -eq '0XC000006A') { return 'Bad password' }
+  if ($u -eq '0XC0000064') { return 'User does not exist' }
+  if ($u -eq '0XC0000234') { return 'Account locked out' }
+  if ($u -eq '0XC0000070') { return 'Account restrictions' }
+  if ($u -eq '0XC000006F') { return 'Logon time restriction' }
+  if ($u -eq '0XC0000071') { return 'Password expired' }
+  if ($u -eq '0XC0000193') { return 'Account expired' }
+  if ($u -eq '0XC0000133') { return 'Time difference at DC' }
+  if ($u -eq '0XC000015B') { return 'Not granted logon type' }
+  if ($u -eq '0XC000005E') { return 'No logon servers available' }
+  if ($s -eq '0XC000006D') { return 'Logon failure' }
+  if ($s -eq '0XC000006A') { return 'Bad password' }
+  if ($s -eq '0XC0000064') { return 'User does not exist' }
+  return 'Unknown reason'
+}
+
+function Get-AuditLogonStatus {
+  $succ = $false; $fail = $false
+  try {
+    $out = & auditpol.exe /get /subcategory:"Logon" 2>$null
+    if ($out) {
+      foreach($line in $out){
+        if ($line -match '(?i)Success\s*:\s*Enable') { $succ = $true }
+        if ($line -match '(?i)Failure\s*:\s*Enable') { $fail = $true }
+      }
+    }
+  } catch {}
+  [PSCustomObject]@{ Success=$succ; Failure=$fail }
+}
+
+function Parse-Event([System.Diagnostics.Eventing.Reader.EventRecord]$e){
+  $xml = [xml]$e.ToXml()
+  $d = @{}
+  foreach($x in $xml.Event.EventData.Data){ $d[$x.Name] = $x.'#text' }
+  $type = $e.Id
+  $user = $d['TargetUserName']
+  $ip   = if($d.ContainsKey('IpAddress') -and $d['IpAddress']) { $d['IpAddress'] } else { '-' }
+  $lt   = $d['LogonType']
+  $ws   = $d['WorkstationName']
+  $st   = $d['Status']
+  $sub  = $d['SubStatus']
+  $reason = if($type -eq 4625){ Get-4625Reason -Status $st -Sub $sub } else { '' }
+  [PSCustomObject]@{ Type=$type; Time=$e.TimeCreated; Record=$e.RecordId; User=$user; IP=$ip; LT=$lt; WS=$ws; Status=$st; Sub=$sub; Reason=$reason }
+}
+
+function Write-Footer($filters){
+  try {
+    $wTop = [Console]::WindowTop
+    $wHeight = [Console]::WindowHeight
+    $wWidth = [Console]::WindowWidth
+    $oldL = [Console]::CursorLeft; $oldT = [Console]::CursorTop
+    $row1 = $wTop
+    $row2 = $wTop + 1
+    $line1 = ($filters + (' ' * $wWidth))
+    if ($line1.Length -gt $wWidth) { $line1 = $line1.Substring(0,$wWidth) }
+    $line2 = '  Live logon monitor. Q=quit  R=RDP-only  S=toggle-success  K=lock  L=list +/-=days +/-  C=clear  E=export  G=GUI' + (' ' * $wWidth)
+    if ($line2.Length -gt $wWidth) { $line2 = $line2.Substring(0,$wWidth) }
+    [Console]::SetCursorPosition(0,$row1); [Console]::Write($line1)
+    [Console]::SetCursorPosition(0,$row2); [Console]::Write($line2)
+    [Console]::SetCursorPosition($oldL,$oldT)
+  } catch {}
+}
+
+# Enable audit policy
+try { & auditpol.exe /set /subcategory:"Logon" /success:enable /failure:enable | Out-Null } catch {}
+$audit = Get-AuditLogonStatus
+Write-Host ("Audit policy: Success={0}  Failure={1}" -f $(if($audit.Success){'On'}else{'Off'}), $(if($audit.Failure){'On'}else{'Off'})) -ForegroundColor DarkCyan
+
+$rdpOnly = $true
+$showSuccess = $true
+$showFail = $true
+$showLock = $true
+$days = 4
+$inp = Read-Host 'Days to list initially (ENTER=4)'
+if ($inp -match '^[0-9]+$' -and [int]$inp -ge 1) { $days = [int]$inp }
+$ids = 4624,4625,4740
+$lastRecord = 0L
+
+$global:lastFooter = ''
+$global:lastFooterAt = Get-Date '2000-01-01'
+$global:lastRow = $null
+function Print-Status(){
+  $s = ("RDP-only={0}  Success={1}  Lockout={2}  Days={3}" -f `
+    $(if($rdpOnly){'On'}else{'Off'}), $(if($showSuccess){'On'}else{'Off'}), $(if($showLock){'On'}else{'Off'}), $days)
+  $now = Get-Date
+  if ($s -ne $global:lastFooter -or ($now - $global:lastFooterAt).TotalMilliseconds -gt 800) {
+    Write-Footer $s
+    $global:lastFooter = $s
+    $global:lastFooterAt = $now
+  }
+}
+
+function Print-Line($o){
+  $global:lastRow = $o
+  if ($o.Type -eq 4624) {
+    if (-not $showSuccess) { return }
+    if ($rdpOnly -and $o.LT -ne '10') { return }
+    Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] SUCCESS {1}@{2} LT={3} WS={4}" -f $o.Time, $o.User, $o.IP, $o.LT, $o.WS) -ForegroundColor Green
+  } elseif ($o.Type -eq 4625) {
+    if (-not $showFail) { return }
+    # Treat RDP-related failures as LT 10 (RemoteInteractive) OR network pre-auth types 3/7
+    if ($rdpOnly -and (@('10','3','7') -notcontains $o.LT)) { return }
+    Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] FAIL    {1}@{2} {3} (Status {4}/{5}) LT={6} WS={7}" -f $o.Time, $o.User, $o.IP, $o.Reason, $o.Status, $o.Sub, $o.LT, $o.WS) -ForegroundColor Red
+  } else {
+    if (-not $showLock) { return }
+    Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] LOCKOUT user={1} caller={2}" -f $o.Time, $o.User, $o.WS) -ForegroundColor Yellow
+  }
+}
+
+function Get-EventByRecordId([long]$rid){
+  try {
+    $fx = @"
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">*[System[(EventRecordID=$rid)]]</Select>
+  </Query>
+</QueryList>
+"@
+    $e = Get-WinEvent -FilterXml $fx -ErrorAction SilentlyContinue | Select-Object -First 1
+    return $e
+  } catch { return $null }
+}
+
+function Show-EventDetailsByObject($o){
+  try {
+    $rid = [long]$o.Record
+  } catch { $rid = $null }
+  $e = $null
+  if ($rid) { $e = Get-EventByRecordId -rid $rid }
+  $tmp = Join-Path $env:TEMP ("neo_event_details_{0:yyyyMMdd_HHmmss}_{1}.txt" -f (Get-Date), $(if($rid){$rid}else{'nr'}))
+  $lines = @()
+  $lines += ("Type:    {0}" -f $o.Type)
+  $lines += ("Time:    {0:yyyy-MM-dd HH:mm:ss}" -f $o.Time)
+  $lines += ("Record:  {0}" -f $(if($rid){$rid}else{'(n/a)'}))
+  $lines += ("User:    {0}" -f $o.User)
+  $lines += ("IP:      {0}" -f $o.IP)
+  $lines += ("LT:      {0}" -f $o.LT)
+  $lines += ("WS:      {0}" -f $o.WS)
+  if ($o.Type -eq 4625) {
+    $lines += ("Status:  {0}" -f $o.Status)
+    $lines += ("Sub:     {0}" -f $o.Sub)
+    $lines += ("Reason:  {0}" -f $o.Reason)
+  }
+  $lines += ('-'*72)
+  if ($e) {
+    try { $lines += ($e | Format-List * | Out-String).TrimEnd() } catch {}
+    $lines += ''
+    try { $lines += 'XML:'; $lines += (([xml]$e.ToXml()).OuterXml) } catch {}
+  } else {
+    $lines += 'Original event payload not available (RecordId lookup failed).'
+  }
+  Set-Content -Path $tmp -Value ($lines -join "`r`n") -Encoding UTF8
+  try { Start-Process notepad.exe $tmp | Out-Null } catch { Write-Host ("Open failed: " + $_.Exception.Message) -ForegroundColor DarkRed }
+}
+
+function Open-GridForSelection(){
+  try {
+    if(-not $lastList -or $lastList.Count -eq 0){ $res = Show-LastDays -d $days; $lastList=$res.Items }
+    $grid = $lastList |
+      Select-Object Time,Type,User,IP,LT,WS,Status,Sub,Reason,Record |
+      Out-GridView -Title 'neo_multiseat live monitor - select a row for details' -PassThru
+    if ($grid) { Show-EventDetailsByObject $grid }
+  } catch {
+    Write-Host ("Grid not available: " + $_.Exception.Message) -ForegroundColor DarkYellow
+    if ($lastList -and $lastList.Count -gt 0) { Show-EventDetailsByObject ($lastList | Select-Object -First 1) }
+  }
+}
+function Show-LastDays([int]$d){
+  if ($d -lt 1) { $d = 1 }
+  try {
+    $ev = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=$ids; StartTime=(Get-Date).AddDays(-$d)} -MaxEvents 10000 -ErrorAction SilentlyContinue
+    $rows = @(); foreach($e in $ev){ $rows += (Parse-Event $e) }
+    $rows = $rows | Sort-Object Time -Descending
+    $filtered = @(); $seen = @{}
+    foreach($r in $rows){
+      if ($seen.ContainsKey([string]$r.Record)) { continue } else { $seen[[string]$r.Record] = 1 }
+      if ($r.Type -eq 4740) { if ($showLock) { $filtered += $r }; continue }
+      if ($rdpOnly) {
+        if ($r.Type -eq 4624) { if ($r.LT -ne '10') { continue } }
+        elseif ($r.Type -eq 4625) { if (@('10','3','7') -notcontains $r.LT) { continue } }
+      }
+      if ($r.Type -eq 4624 -and $showSuccess) { $filtered += $r; continue }
+      if ($r.Type -eq 4625 -and $showFail) { $filtered += $r; continue }
+    }
+    if($filtered.Count -gt 0){ return [PSCustomObject]@{ LastRecord=[long]$filtered[0].Record; Items=$filtered } }
+  } catch { Write-Host ("Error loading history: " + $_.Exception.Message) -ForegroundColor DarkRed }
+  return [PSCustomObject]@{ LastRecord=$lastRecord; Items=@() }
+}
+
+function Refresh-List(){
+  $res = Show-LastDays -d $days
+  $script:lastRecord = [long]$res.LastRecord
+  $script:lastList = $res.Items
+}
+
+Print-Status
+$since = (Get-Date).AddSeconds(-3)
+  while ($true) {
+    while([Console]::KeyAvailable){
+      $k=[Console]::ReadKey($true)
+      if($k.Key -eq 'Q'){ return }
+      if($k.Key -eq 'R'){ $rdpOnly = -not $rdpOnly; Print-Status; Refresh-List }
+      if($k.Key -eq 'S'){ $showSuccess = -not $showSuccess; Print-Status; Refresh-List }
+      if($k.Key -eq 'K'){ $showLock = -not $showLock; Print-Status; Refresh-List }
+      if($k.Key -eq 'OemPlus' -or $k.KeyChar -eq '+'){ $days += 1; Print-Status; Refresh-List }
+      if($k.Key -eq 'OemMinus' -or $k.KeyChar -eq '-') { if($days -gt 1){ $days -= 1 }; Print-Status; Refresh-List }
+    if($k.Key -eq 'C'){ Clear-Host; Print-Status; Refresh-List }
+    if($k.Key -eq 'L'){
+        # On-demand listing: print current filtered items (newest first)
+        try {
+          if(-not $lastList){ $res = Show-LastDays -d $days; $lastRecord = [long]$res.LastRecord; $lastList=$res.Items }
+          Clear-Host
+          # Re-draw pinned header, then list below
+          Print-Status
+          Write-Host ''
+          Write-Host ("Listing last {0} day(s) (filtered, newest first)." -f $days) -ForegroundColor Cyan
+          $toShow = $lastList | Select-Object -First 200
+          foreach($row in $toShow){ Print-Line $row }
+          Write-Host ''
+        } catch { Write-Host ("List failed: " + $_.Exception.Message) -ForegroundColor DarkRed }
+      }
+      if($k.Key -eq 'E'){
+        try {
+          if(-not $lastList){ $res = Show-LastDays -d $days; $lastList=$res.Items }
+          $export = $lastList | Select-Object -First 24 | Select-Object Time,Type,User,IP,LT,WS,Status,Sub,Reason
+          $out = Join-Path $PSScriptRoot ("live_monitor_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
+          $export | Export-Csv -Path $out -NoTypeInformation -Encoding UTF8
+          Write-Host ("Exported to " + $out) -ForegroundColor Green
+        } catch { Write-Host ("Export failed: " + $_.Exception.Message) -ForegroundColor DarkRed }
+      }
+      if($k.Key -eq 'G'){ Open-GridForSelection }
+  }
+  try {
+    $ev = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=$ids; StartTime=$since} -ErrorAction SilentlyContinue
+    $new = @(); foreach($e in $ev){ if([long]$e.RecordId -gt [long]$lastRecord){ $new += $e } }
+    if ($new.Count -gt 0) {
+      $parsed = $new | ForEach-Object { Parse-Event $_ } | Sort-Object Time
+      foreach($r in $parsed){
+        if ($r.Type -eq 4740) { if ($showLock) { Print-Line $r } }
+        elseif ($r.Type -eq 4624) { if ($showSuccess -and (-not $rdpOnly -or $r.LT -eq '10')) { Print-Line $r } }
+        elseif ($r.Type -eq 4625) { if ($showFail -and (-not $rdpOnly -or (@('10','3','7') -contains $r.LT))) { Print-Line $r } }
+        if([long]$r.Record -gt [long]$lastRecord){ $lastRecord = [long]$r.Record }
+      }
+      $since = ($parsed[-1]).Time
+    } else { $since = (Get-Date) }
+  } catch { Write-Host ("Monitor error: " + $_.Exception.Message) -ForegroundColor DarkRed }
+  Print-Status
+  Start-Sleep -Milliseconds 500
+}
+'@
+  Set-Content -Path $tmp -Value $script -Encoding UTF8
+  $alist2 = @('-NoExit','-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', $tmp)
+  Start-Process -FilePath 'powershell.exe' -ArgumentList $alist2 -WindowStyle Normal | Out-Null
 }
 
 function Enforce-NLA-And-TLS {
@@ -946,30 +1509,237 @@ function Show-RdpRecentTable {
   Read-Host "Press ENTER to return"
 }
 
+# --- Account lockout status helpers -----------------------------------
+function Get-AccountLockoutStatus {
+  $status = [PSCustomObject]@{ Active=$false; Threshold=0; Duration=0; Window=0 }
+  try {
+    $out = & (Join-Path $env:SystemRoot 'System32\net.exe') accounts 2>$null
+    if ($out) {
+      foreach ($line in $out) {
+        $l = $line.Trim()
+        if ($l -match '(?i)lockout.*threshold.*?:\s*(\d+)') { $status.Threshold = [int]$Matches[1] }
+        elseif ($l -match '(?i)lockout.*duration.*?:\s*(\d+)') { $status.Duration = [int]$Matches[1] }
+        elseif ($l -match '(?i)lockout.*window.*?:\s*(\d+)') { $status.Window = [int]$Matches[1] }
+      }
+      if ($status.Threshold -gt 0) { $status.Active = $true }
+    }
+  } catch {}
+  return $status
+}
+
+
+function Show-AccountLockoutStatus {
+  $s = Get-AccountLockoutStatus
+  if ($s.Active) {
+    Write-Host ("Lockout policy: Active  threshold={0}  duration={1}m  window={2}m" -f $s.Threshold,$s.Duration,$s.Window) -ForegroundColor Green
+  } else {
+    Write-Host "Lockout policy: Not set (threshold=0)" -ForegroundColor Red
+  }
+}
+
+function Get-DoublePromptStatus {
+  $nla = (Get-ItemProperty -Path $RdpKey -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
+  $p1  = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name 'fPromptForPassword' -ErrorAction SilentlyContinue).fPromptForPassword
+  $p2  = (Get-ItemProperty -Path $RdpKey -Name 'fPromptForPassword' -ErrorAction SilentlyContinue).fPromptForPassword
+  return ( ($nla -eq 1) -and ( ($p1 -eq 1) -or ($p2 -eq 1) ) )
+}
+
+function Show-DoublePromptStatus {
+  $on = Get-DoublePromptStatus
+  if ($on) { Write-Host 'Double Prompt: Enabled' -ForegroundColor Green } else { Write-Host 'Double Prompt: Disabled' -ForegroundColor DarkGray }
+}
+
+# --- Inline live logon monitor (4624/4625/4740) -----------------------
+function Get-AuditLogonStatus {
+  $succ = $false; $fail = $false
+  try {
+    $out = & auditpol.exe /get /subcategory:"Logon" 2>$null
+    if ($out) {
+      foreach($line in $out){
+        if ($line -match '(?i)Success\s*:\s*Enable') { $succ = $true }
+        if ($line -match '(?i)Failure\s*:\s*Enable') { $fail = $true }
+      }
+    }
+  } catch {}
+  [PSCustomObject]@{ Success=$succ; Failure=$fail }
+}
+function Start-LiveLogonMonitor {
+  Write-Host ""; Show-ImportantBanner -Text "Live logon monitor. Q=quit  R=RDP-only  F=cycle(both/fail/succ)  S=succ  K=lock  L=list +/-=days +/-  C=clear  E=export" -Fg Black -Bg Yellow
+  # Ensure audit policy for Logon success/failure
+  try { & auditpol.exe /set /subcategory:"Logon" /success:enable /failure:enable | Out-Null } catch {}
+  $audit = Get-AuditLogonStatus
+  Write-Host ("Audit policy: Success={0}  Failure={1}" -f $(if($audit.Success){'On'}else{'Off'}), $(if($audit.Failure){'On'}else{'Off'})) -ForegroundColor DarkCyan
+
+  $rdpOnly = $true
+  $showSuccess = $true
+  $showFail = $true
+  $showLock = $true
+  $days = 4
+  $inp = Read-Host 'Days to list initially (ENTER=4)'
+  if ($inp -match '^[0-9]+$' -and [int]$inp -ge 1) { $days = [int]$inp }
+  $ids = 4624,4625,4740
+  $lastRecord = 0L
+
+  function Parse-Event([System.Diagnostics.Eventing.Reader.EventRecord]$e){
+    $xml = [xml]$e.ToXml()
+    $d = @{}
+    foreach($x in $xml.Event.EventData.Data){ $d[$x.Name] = $x.'#text' }
+    $type = $e.Id
+    $user = $d['TargetUserName']
+    $ip   = if($d.ContainsKey('IpAddress') -and $d['IpAddress']) { $d['IpAddress'] } else { '-' }
+    $lt   = $d['LogonType']
+    $ws   = $d['WorkstationName']
+    $st   = $d['Status']
+    $sub  = $d['SubStatus']
+    $reason = if($type -eq 4625){ Get-4625Reason -Status $st -Sub $sub } else { '' }
+    [PSCustomObject]@{ Type=$type; Time=$e.TimeCreated; Record=$e.RecordId; User=$user; IP=$ip; LT=$lt; WS=$ws; Status=$st; Sub=$sub; Reason=$reason }
+  }
+
+  function Print-Line($o){
+    if ($o.Type -eq 4624) {
+      if (-not $showSuccess) { return }
+      if ($rdpOnly -and $o.LT -ne '10') { return }
+      Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] SUCCESS {1}@{2} LT={3} WS={4}" -f $o.Time, $o.User, $o.IP, $o.LT, $o.WS) -ForegroundColor Green
+    } elseif ($o.Type -eq 4625) {
+      if (-not $showFail) { return }
+      if ($rdpOnly -and $o.LT -ne '10') { return }
+      Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] FAIL    {1}@{2} {3} (Status {4}/{5}) LT={6} WS={7}" -f $o.Time, $o.User, $o.IP, $o.Reason, $o.Status, $o.Sub, $o.LT, $o.WS) -ForegroundColor Red
+    } else {
+      if (-not $showLock) { return }
+      Write-Host ("[{0:yyyy-MM-dd HH:mm:ss}] LOCKOUT user={1} caller={2}" -f $o.Time, $o.User, $o.WS) -ForegroundColor Yellow
+    }
+  }
+
+  function Show-LastDays([int]$d){
+    if ($d -lt 1) { $d = 1 }
+    try {
+      $ev = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=$ids; StartTime=(Get-Date).AddDays(-$d)} -MaxEvents 10000 -ErrorAction SilentlyContinue
+      $rows = @()
+      foreach($e in $ev){ $rows += (Parse-Event $e) }
+      $rows = $rows | Sort-Object Time -Descending
+      $filtered = @()
+      foreach($r in $rows){
+        if ($r.Type -eq 4740) { if ($showLock) { $filtered += $r }; continue }
+        if ($rdpOnly -and $r.LT -ne '10') { continue }
+        if ($r.Type -eq 4624 -and $showSuccess) { $filtered += $r; continue }
+        if ($r.Type -eq 4625 -and $showFail) { $filtered += $r; continue }
+      }
+      Write-Host ""; Write-Host ("Last {0} day(s): showing {1} events (newest first)" -f $d, $filtered.Count) -ForegroundColor Cyan
+      foreach($r in $filtered){ Print-Line $r }
+      if($filtered.Count -gt 0){ return [PSCustomObject]@{ LastRecord=[long]$filtered[0].Record; Items=$filtered } }
+    } catch { Write-Host ("Error loading history: " + $_.Exception.Message) -ForegroundColor DarkRed }
+    return [PSCustomObject]@{ LastRecord=$lastRecord; Items=@() }
+  }
+
+  function Print-Status() {
+    Write-Host ("Filters: RDP-only={0}  Success={1}  Fail={2}  Lockout={3}  Days={4}" -f `
+      $(if($rdpOnly){'On'}else{'Off'}), $(if($showSuccess){'On'}else{'Off'}), $(if($showFail){'On'}else{'Off'}), $(if($showLock){'On'}else{'Off'}), $days) -ForegroundColor DarkCyan
+  }
+  function Cycle-ViewMode() {
+    if ($showSuccess -and $showFail) {
+      $showSuccess = $false; $showFail = $true; return
+    }
+    if (-not $showSuccess -and $showFail) {
+      $showSuccess = $true; $showFail = $false; return
+    }
+    # success-only or any other state -> both
+    $showSuccess = $true; $showFail = $true
+  }
+  Print-Status
+  $res = Show-LastDays -d $days; $lastRecord = [long]$res.LastRecord; $lastList = $res.Items
+  $since = (Get-Date).AddSeconds(-3)
+  while ($true) {
+    while([Console]::KeyAvailable){
+      $k=[Console]::ReadKey($true)
+      if($k.Key -eq 'Q'){ return }
+      if($k.Key -eq 'R'){ $rdpOnly = -not $rdpOnly; Print-Status }
+      if($k.Key -eq 'F'){ Cycle-ViewMode; Print-Status }
+      if($k.Key -eq 'S'){ $showSuccess = -not $showSuccess; Print-Status }
+      if($k.Key -eq 'K'){ $showLock = -not $showLock; Print-Status }
+      if($k.Key -eq 'OemPlus' -or $k.KeyChar -eq '+'){ $days += 1; Print-Status }
+      if($k.Key -eq 'OemMinus' -or $k.KeyChar -eq '-') { if($days -gt 1){ $days -= 1 }; Print-Status }
+      if($k.Key -eq 'C'){ Clear-Host; Show-ImportantBanner -Text "Live logon monitor. Q=quit  R=RDP-only  S=succ  F=fail  K=lock  L=list +/-=days +/-  C=clear  E=export" -Fg Black -Bg Yellow; $audit = Get-AuditLogonStatus; Write-Host ("Audit policy: Success={0}  Failure={1}" -f $(if($audit.Success){'On'}else{'Off'}), $(if($audit.Failure){'On'}else{'Off'})) -ForegroundColor DarkCyan; Print-Status; $res = Show-LastDays -d $days; $lastRecord = [long]$res.LastRecord; $lastList=$res.Items }
+      if($k.Key -eq 'L'){ $res = Show-LastDays -d $days; $lastRecord = [long]$res.LastRecord; $lastList=$res.Items }
+      if($k.Key -eq 'E'){ try { if(-not $lastList){ $res = Show-LastDays -d $days; $lastList=$res.Items } ; $export = $lastList | Select-Object -First 24 | Select-Object Time,Type,User,IP,LT,WS,Status,Sub,Reason ; $csv = Join-Path $script:LogDir ("live_monitor_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)) ; $export | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8 ; Write-Host ("Exported to " + $csv) -ForegroundColor Green } catch { Write-Host ("Export failed: " + $_.Exception.Message) -ForegroundColor DarkRed } }
+    }
+    try {
+      $ev = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=$ids; StartTime=$since} -ErrorAction SilentlyContinue
+      $new = @(); foreach($e in $ev){ if([long]$e.RecordId -gt [long]$lastRecord){ $new += $e } }
+      if ($new.Count -gt 0) {
+        $parsed = $new | ForEach-Object { Parse-Event $_ }
+        $parsed = $parsed | Sort-Object Time
+        foreach($r in $parsed){ 
+          if ($r.Type -eq 4740) { if ($showLock) { Print-Line $r } }
+          elseif ($r.Type -eq 4624) { if ($showSuccess -and (-not $rdpOnly -or $r.LT -eq '10')) { Print-Line $r } }
+          elseif ($r.Type -eq 4625) { if ($showFail -and (-not $rdpOnly -or (@('10','3','7') -contains $r.LT))) { Print-Line $r } }
+          if([long]$r.Record -gt [long]$lastRecord){ $lastRecord = [long]$r.Record }
+        }
+        $since = ($parsed[-1]).Time
+      } else {
+        $since = (Get-Date)
+      }
+    } catch { Write-Host ("Monitor error: " + $_.Exception.Message) -ForegroundColor DarkRed }
+    Start-Sleep -Milliseconds 700
+  }
+}
+
+# --- Double-prompt (NLA + always prompt for password on host) ---------
+function Toggle-DoublePromptAuth {
+  $preview = @(
+    "Enable NLA (UserAuthentication=1)",
+    "Always prompt for password upon connection (host GUI)",
+    "Apply to policy + live RDP-Tcp"
+  )
+  $cli = @(
+    'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UserAuthentication /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fPromptForPassword /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fPromptForPassword /t REG_DWORD /d 1 /f'
+  )
+  Confirm-Apply -Title "Enable Double Prompt (NLA + host password)" -PreviewLines $preview -ManualCli $cli -Action {
+    New-ItemProperty -Path $RdpKey -Name UserAuthentication -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name 'fPromptForPassword' -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -Path $RdpKey -Name 'fPromptForPassword' -PropertyType DWord -Value 1 -Force | Out-Null
+    # Read-back status and print
+    $nla = (Get-ItemProperty -Path $RdpKey -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
+    $p1  = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name 'fPromptForPassword' -ErrorAction SilentlyContinue).fPromptForPassword
+    $p2  = (Get-ItemProperty -Path $RdpKey -Name 'fPromptForPassword' -ErrorAction SilentlyContinue).fPromptForPassword
+    $on = ($nla -eq 1) -and (($p1 -eq 1) -or ($p2 -eq 1))
+    if ($on) { Write-Host 'Double Prompt: Enabled' -ForegroundColor Green } else { Write-Host 'Double Prompt: Not fully enabled' -ForegroundColor Red }
+  }
+}
+
 function NetModes-Menu {
-  Ensure-NeoFirewallRules
+  # Initialize once to avoid slow repeated scans
+  Align-NeoFirewallRules
+  Disable-BaseRdpFirewallRules
   Reconcile-NetConfig
+  Sync-BlockRules
+  Refresh-NetModesCache -Force
 
   while ($true) {
-    Show-NetModesStatus
+    Start-MonitorIfTriggered
+    Show-NetModesStatusCached
     Write-Host ''
     Write-Host '[1] Toggle LAN On/Off'
     Write-Host '[2] Toggle WAN On/Off'
     Write-Host '[3] Toggle Tailscale On/Off'
     Write-Host '[4] Edit LAN allowlist (CIDR/IPs, comma-separated)'
     Write-Host '[5] Edit WAN allowlist (CIDR/IPs, comma-separated)'
+    Write-Host '[R] Refresh status'
     Write-Host '[A] Advanced security (NLA/TLS, NTLMv1, Lockout, Monitor, Tailscale helper, Recent totals)'
     Write-Host '[B] Back'
     $ch = Read-Host 'Choose'
 
     switch -Regex ($ch) {
       '^(?i)1$' {
+        Align-NeoFirewallRules
         $target = -not ((Get-NetFirewallRule -DisplayName $RuleLAN).Enabled -eq 'True')
         $prev = @("Set $RuleLAN Enabled = $target")
-        Confirm-Apply -Title "Toggle LAN" -PreviewLines $prev -Action { Toggle-Mode -Mode LAN -Enabled:$target }
+        Confirm-Apply -Title "Toggle LAN" -PreviewLines $prev -Action { Toggle-Mode -Mode LAN -Enabled:$target; Sync-BlockRules }
         continue
       }
       '^(?i)2$' {
+        Align-NeoFirewallRules
         $target = -not ((Get-NetFirewallRule -DisplayName $RuleWAN).Enabled -eq 'True')
         $prev = @("Set $RuleWAN Enabled = $target")
         if ($target -and -not (Load-NetConfig).WAN.Allowlist.Count) {
@@ -977,14 +1747,22 @@ function NetModes-Menu {
           $cidrs = Input-CIDRs -Prompt 'WAN allowlist'
           if (-not $cidrs.Count) { Write-Host 'Cancelled.' ; continue }
           Confirm-Apply -Title "Set WAN allowlist" -PreviewLines @("WAN allowlist -> " + ($cidrs -join ', ')) -Action { Set-WAN-Allowlist -Cidrs $cidrs }
+        } elseif ($target) {
+          $cfg = Load-NetConfig
+          if (-not (Test-WAN-AllowlistSafe $cfg.WAN.Allowlist)) {
+            Write-Host 'Refusing to enable WAN: allowlist contains Any/0.0.0.0/0 or is empty.' -ForegroundColor Red
+            Write-Host 'Edit the WAN allowlist (option 5) to specific CIDRs/IPs.' -ForegroundColor Yellow
+            continue
+          }
         }
-        Confirm-Apply -Title "Toggle WAN" -PreviewLines $prev -Action { Toggle-Mode -Mode WAN -Enabled:$target }
+        Confirm-Apply -Title "Toggle WAN" -PreviewLines $prev -Action { Toggle-Mode -Mode WAN -Enabled:$target; Sync-BlockRules }
         continue
       }
       '^(?i)3$' {
+        Align-NeoFirewallRules
         $target = -not ((Get-NetFirewallRule -DisplayName $RuleTS).Enabled -eq 'True')
         $prev = @("Set $RuleTS Enabled = $target")
-        Confirm-Apply -Title "Toggle Tailscale" -PreviewLines $prev -Action { Toggle-Mode -Mode TS -Enabled:$target }
+        Confirm-Apply -Title "Toggle Tailscale" -PreviewLines $prev -Action { Toggle-Mode -Mode TS -Enabled:$target; Sync-BlockRules }
         continue
       }
       '^(?i)4$' {
@@ -997,25 +1775,32 @@ function NetModes-Menu {
         Confirm-Apply -Title "Set WAN allowlist" -PreviewLines @("WAN allowlist -> " + ($cidrs -join ', ')) -Action { Set-WAN-Allowlist -Cidrs $cidrs }
         continue
       }
+      '^(?i)R$' { Refresh-NetModesCache -Force; continue }
       '^(?i)A$' {
         while ($true) {
           Write-Host ''
           Write-Host '=== Advanced security ===' -ForegroundColor Cyan
+          Show-AccountLockoutStatus
+          Show-DoublePromptStatus
           Write-Host '[1] Enforce NLA + TLS (recommended for WAN)'
           Write-Host '[2] Disable NTLMv1 (NTLMv2 only)'
           Write-Host '[3] Set Account Lockout (25 fails / 60min)'
-          Write-Host '[4] Live monitor: failed logons (4625/4740) [press Q to quit]'
+          Write-Host '[4] Live monitor (inline: success/fail/lockout)'
           Write-Host '[5] Tailscale helper (detect/install hints)'
           Write-Host '[6] Show auth totals (~24h)'
+          # Removed by request to simplify advanced menu
+          Write-Host '[10] Enable Double Prompt (NLA + host password)'
           Write-Host '[B] Back'
           $ax = Read-Host 'Choose'
           switch -Regex ($ax) {
             '^(?i)1$' { Enforce-NLA-And-TLS; continue }
             '^(?i)2$' { Disable-NTLMv1; continue }
-            '^(?i)3$' { Set-AccountLockoutPolicy; continue }
-            '^(?i)4$' { Start-BruteforceMonitor; continue }
+            '^(?i)3$' { Set-AccountLockoutPolicy; Show-AccountLockoutStatus; continue }
+            '^(?i)4$' { Start-LiveMonitorWindow; continue }
             '^(?i)5$' { Tailscale-Helper; continue }
             '^(?i)6$' { Show-RdpRecentTable; continue }
+            # options 7/8/9 removed
+            '^(?i)10$' { Toggle-DoublePromptAuth; continue }
             '^(?i)B$' { break }
             default   { Write-Host 'Invalid.'; continue }
           }
@@ -1069,6 +1854,7 @@ function Show-StartMenu {
   Write-Host "======================================="
   Write-Host " neo_multiseat (RDP Wrapper)"
   Write-Host "======================================="
+  Start-MonitorIfTriggered
   Show-HealthStrip
   Write-Host '[1] Install/Configure neo_multiseat (user + RDP Wrapper)'
   Write-Host '[2] Fix RDP services (reset termsrv.dll, uninstall wrapper)'
@@ -1111,3 +1897,4 @@ try {
   Read-Host "Press ENTER to close this window"
   Stop-Transcript | Out-Null
 }
+ 
