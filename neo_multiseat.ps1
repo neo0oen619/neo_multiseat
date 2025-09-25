@@ -58,8 +58,6 @@ trap {
 $DL = @{
   RDPWrapZip = 'https://github.com/neo0oen619/neo_multiseat_rdpwrap_backup/releases/download/backup/RDPWrap-v1.6.2.1.zip'
   AutoZip    = 'https://github.com/neo0oen619/neo_multiseat_rdpwrap_backup/raw/refs/heads/master/autoupdate_v1.2.zip'
-  FreeRdpZip = 'https://github.com/FreeRDP/FreeRDP/releases/download/3.5.0/FreeRDP-3.5.0-x64.zip'
-  FreeRdpHash = 'https://github.com/FreeRDP/FreeRDP/releases/download/3.5.0/FreeRDP-3.5.0-x64.zip.sha256'
 }
 
 # --- Paths / constants -------------------------------------------------
@@ -391,7 +389,6 @@ function New-NeoRdpFile {
          Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' } |
          Select-Object -ExpandProperty IPAddress
   $primary = if ($ips) { $ips | Select-Object -First 1 } else { $env:COMPUTERNAME }
-  $port = Get-RdpPort
 
   $rdpLines = @(
     ("full address:s:{0}" -f $primary),
@@ -417,108 +414,6 @@ function New-NeoRdpFile {
   } catch {
     Write-Warning "Could not write .RDP file(s): $($_.Exception.Message)"
   }
-
-  try {
-    $clientExe = Ensure-FreeRdpClient
-    if ($clientExe) {
-      New-FreeRdpLauncher -TargetUser $TargetUser -Host $primary -Port $port -ClientExe $clientExe
-    }
-  } catch {
-    Write-Warning "FreeRDP launcher generation failed: $($_.Exception.Message)"
-  }
-}
-
-function Ensure-FreeRdpClient {
-  $version = '3.5.0'
-  $clientRoot = Join-Path $PSScriptRoot 'clients'
-  $versionDir = Join-Path $clientRoot ("FreeRDP-$version")
-
-  $existing = Get-ChildItem -Path $versionDir -Filter 'wfreerdp.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($existing) { return $existing.FullName }
-
-  if (-not (Test-Path $versionDir)) { New-Item -ItemType Directory -Path $versionDir -Force | Out-Null }
-
-  $zipPath = Join-Path $env:TEMP ("FreeRDP_{0}_{1}.zip" -f $version, [Guid]::NewGuid().ToString('N'))
-  $hashPath = "$zipPath.sha256"
-
-  if (-not (Get-WebFile -Uri $DL.FreeRdpZip -OutFile $zipPath)) { throw "Could not download FreeRDP zip." }
-
-  if ($DL.FreeRdpHash) {
-    if (-not (Get-WebFile -Uri $DL.FreeRdpHash -OutFile $hashPath)) { throw "Could not download FreeRDP hash." }
-    $expected = (Get-Content -Path $hashPath -ErrorAction Stop | Select-Object -First 1)
-    if ($expected) {
-      $expected = ($expected -split '\s+')[0].Trim().ToLower()
-      $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
-      if ($expected -and $actual -ne $expected) {
-        Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $hashPath -Force -ErrorAction SilentlyContinue
-        throw "FreeRDP zip hash mismatch."
-      }
-    }
-  }
-
-  if (-not (Extract-Zip -ZipPath $zipPath -Dest $versionDir)) { throw "Failed to extract FreeRDP zip." }
-
-  Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
-  if (Test-Path $hashPath) { Remove-Item -Path $hashPath -Force -ErrorAction SilentlyContinue }
-
-  $exe = Get-ChildItem -Path $versionDir -Filter 'wfreerdp.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $exe) { throw "wfreerdp.exe not found after extraction." }
-
-  return $exe.FullName
-}
-
-function New-FreeRdpLauncher {
-  param(
-    [Parameter(Mandatory=$true)][string]$TargetUser,
-    [Parameter(Mandatory=$true)][string]$Host,
-    [Parameter(Mandatory=$true)][int]$Port,
-    [Parameter(Mandatory=$true)][string]$ClientExe
-  )
-
-  $clientDir = Split-Path -Path $ClientExe -Parent
-  $cmdName = "Connect - $TargetUser (FreeRDP).cmd"
-  $destinations = @(
-    Join-Path $PSScriptRoot $cmdName,
-    Join-Path $env:Public ("Desktop\" + $cmdName)
-  )
-
-  $cmdLines = @(
-    '@echo off',
-    'setlocal',
-    ("set \"CLIENT_DIR={0}\"" -f $clientDir),
-    'set "CLIENT=%CLIENT_DIR%\wfreerdp.exe"',
-    'if not exist "%CLIENT%" (',
-    '  echo FreeRDP client is missing. Please rerun neo_multiseat.ps1.',
-    '  pause',
-    '  exit /b 1',
-    ')',
-    'pushd "%CLIENT_DIR%"',
-    ("\"%CLIENT%\" /v:{0}:{1} /u:{2} ^" -f $Host,$Port,$TargetUser),
-    '  /gfx-h264:avc444 +gfx-progressive /network:auto ^',
-    '  /dynamic-resolution /bpp:32 /rfx ^',
-    '  /mouse:relative:on /grab:keyboard ^',
-    '  /scale:100 /kbd:0x409',
-    'set "EXITCODE=%ERRORLEVEL%"',
-    'popd',
-    'endlocal & exit /b %EXITCODE%'
-  )
-
-  $content = ($cmdLines -join "`r`n") + "`r`n"
-  $encoding = [System.Text.Encoding]::ASCII
-
-  foreach ($dest in $destinations) {
-    try {
-      $dir = Split-Path -Path $dest -Parent
-      if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-      [System.IO.File]::WriteAllText($dest, $content, $encoding)
-    } catch {
-      Write-Warning "Failed to create FreeRDP launcher at $dest: $($_.Exception.Message)"
-    }
-  }
-
-  Write-Host "Created FreeRDP launcher(s):" -ForegroundColor Green
-  foreach ($dest in $destinations) { Write-Host "  $dest" }
 }
 
 # --- Networking + zip helpers -----------------------------------------
