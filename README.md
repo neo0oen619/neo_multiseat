@@ -17,7 +17,7 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 
 - **One script, one job** — a clean menu that guides you end‑to‑end.
 - **Pick or create a user** — list existing accounts, reset a password, or add a new one.
-- **Always creates a `.rdp` file** — named after the chosen user *and* timestamp.
+- **Always creates connection files** — classic `.rdp` plus a FreeRDP `.cmd` with gamer-friendly defaults.
 - **Supports more than two seats** — concurrent sessions for multiple users (people run 3–5 regularly; **10 can be done** on capable hardware/configs).
 - **Works with your fork** — downloads and updates from your repo for stability.
 - **Auto‑updates the good stuff** — fetches updated config after Windows updates.
@@ -41,6 +41,8 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
   - `neo_multiseat.net.json` — network modes config (auto‑created)
   - `neo_multiseat_*.log` — transcript logs per run
   - `*.rdp` — generated connection files (per user)
+  - `Connect - <user> (FreeRDP).cmd` — launches FreeRDP with relative mouse support
+  - `clients/FreeRDP-<version>/` — cached FreeRDP binaries (downloaded once, hash-verified)
 
 ---
 
@@ -86,18 +88,26 @@ When done, **reboot once** before testing the extra seats.
 
 ## How to connect (super explicit)
 
-- The script **always** creates a ready‑to‑use `.rdp` file when you pick or create a user.
-- File name format:  
-  `Seat2_<username>_<YYYYMMDD_HHMMSS>.rdp`
-- Where to find it:
+- The script **always** creates ready-to-use connection files when you pick or create a user.
+  - Classic Remote Desktop: `Seat2_<username>_<YYYYMMDD_HHMMSS>.rdp`
+  - Zero-setup FreeRDP launcher: `Connect - <username> (FreeRDP).cmd`
+- Where to find them:
   - In the **same folder** as the script
-  - On the **Public Desktop** (so it’s easy for everyone)
+  - On the **Public Desktop** (so they’re easy for everyone)
 - To connect:
-  1. Double‑click the `.rdp` file.
+  1. Double-click either file. The `.rdp` opens Microsoft’s client; the `.cmd` launches the bundled FreeRDP with relative mouse enabled.
   2. When prompted, enter the password you set in the script for that user.
   3. If you see any warning, read it (responsibly), then continue.
 
 > Tip: You can copy the `.rdp` file to another machine and connect across the network (make sure PCs can see each other and ports/firewall are open).
+
+
+### FreeRDP launchers (fixing the trapped mouse)
+
+- Uses the official `wfreerdp.exe` build (3.5.0) downloaded once and SHA256-verified.
+- Launch command mirrors the Phoronix-tested flags so the client sends **relative mouse deltas**.
+- Helpful when games lock the pointer to the primary display; FreeRDP keeps the cursor moving smoothly in extra seats.
+- Files live next to the script and on the Public Desktop — delete them if you prefer the stock `.rdp`.
 
 ---
 
