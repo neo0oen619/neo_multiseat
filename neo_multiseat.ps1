@@ -382,37 +382,414 @@ function Show-HealthStrip {
   Write-Host '(~24h)'
 }
 
-# --- RDP file helper (exact username filename) ------------------------
+# --- Shortcut helper ---------------------------------------------------
+function New-NeoShortcut {
+  param(
+    [Parameter(Mandatory=$true)][string]$ShortcutPath,
+    [Parameter(Mandatory=$true)][string]$TargetPath,
+    [string]$Arguments = "",
+    [string]$WorkingDirectory = ""
+  )
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($ShortcutPath)
+    $shortcut.TargetPath = $TargetPath
+    if ($Arguments) { $shortcut.Arguments = $Arguments }
+    if ($WorkingDirectory) { $shortcut.WorkingDirectory = $WorkingDirectory }
+    else {
+      $shortcut.WorkingDirectory = Split-Path -Path $TargetPath -Parent
+    }
+    $shortcut.IconLocation = "$TargetPath,0"
+    $shortcut.Save()
+    return $true
+  } catch {
+    Write-Warning "Failed to create shortcut $ShortcutPath: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+# --- RDP file helper (timestamped Seat2 naming) ------------------------
+function Get-NeoClientVersion {
+  return '1.1.0.0'
+}
+
+function Get-NeoClientPath {
+  return (Join-Path $PSScriptRoot 'neo_rdp_client.exe')
+}
+
+function Get-NeoClientSource {
+  @'
+using System;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+
+namespace NeoMultiseat.Client
+{
+    internal sealed class RdpClientHost : AxHost
+    {
+        private static readonly string[] PreferredProgIds = new[]
+        {
+            "MsRdpClient11NotSafeForScripting",
+            "MsRdpClient10NotSafeForScripting",
+            "MsRdpClient9NotSafeForScripting",
+            "MsRdpClient8NotSafeForScripting",
+            "MsRdpClient7NotSafeForScripting"
+        };
+
+        private static readonly string ResolvedClsid = ResolveClsid();
+
+        public RdpClientHost() : base(ResolvedClsid)
+        {
+        }
+
+        private static string ResolveClsid()
+        {
+            foreach (var progId in PreferredProgIds)
+            {
+                var type = Type.GetTypeFromProgID(progId, false);
+                if (type != null)
+                {
+                    return type.GUID.ToString("B");
+                }
+            }
+
+            throw new InvalidOperationException("Microsoft RDP ActiveX control is not available on this system.");
+        }
+    }
+
+    internal static class RdpClientTweaks
+    {
+        public static void TryEnableRelativeMouse(dynamic ocx)
+        {
+            if (ocx == null)
+            {
+                return;
+            }
+
+            try
+            {
+                TryInvokeExtendedProperty(ocx, "AllowRelativeMouseMode", true);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                ocx.AdvancedSettings9.RelativeMouseMode = true;
+            }
+            catch
+            {
+            }
+        }
+
+        private static object GetAdvanced(object ocx)
+        {
+            if (ocx == null)
+            {
+                return null;
+            }
+
+            var type = ocx.GetType();
+            foreach (var property in new[] { "AdvancedSettings12", "AdvancedSettings11", "AdvancedSettings10", "AdvancedSettings9", "AdvancedSettings8", "AdvancedSettings7" })
+            {
+                try
+                {
+                    return type.InvokeMember(property, BindingFlags.GetProperty, null, ocx, null);
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
+        private static void TryInvokeExtendedProperty(object ocx, string name, object value)
+        {
+            if (ocx == null)
+            {
+                return;
+            }
+
+            var type = ocx.GetType();
+            var args = new[] { name, value };
+
+            foreach (var candidate in new[] { "SetProperty", "set_Property", "put_Property" })
+            {
+                try
+                {
+                    type.InvokeMember(candidate, BindingFlags.InvokeMethod, null, ocx, args);
+                    return;
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        public static void ApplySessionSettings(dynamic ocx, string server, string username, int port)
+        {
+            if (ocx == null)
+            {
+                throw new ArgumentNullException(nameof(ocx));
+            }
+
+            try { ocx.ColorDepth = 32; } catch { }
+
+            var advancedObj = GetAdvanced(ocx);
+            if (advancedObj != null)
+            {
+                dynamic advanced = advancedObj;
+                try { advanced.RDPPort = port; } catch { }
+                try { advanced.SmartSizing = false; } catch { }
+                try { advanced.EnableWindowsKey = 1; } catch { }
+                try { advanced.KeyboardHookMode = 2; } catch { }
+                try { advanced.RedirectDynamicDrives = false; } catch { }
+                try { advanced.RedirectDynamicDevices = false; } catch { }
+                try { advanced.EnableCredSspSupport = true; } catch { }
+                try { advanced.RelativeMouseMode = true; } catch { }
+            }
+
+            TryEnableRelativeMouse(ocx);
+
+            try { ocx.FullScreen = true; } catch { }
+
+            ocx.Server = server;
+            ocx.UserName = username ?? string.Empty;
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        private static void Main(string[] args)
+        {
+            string server = args.Length > 0 ? args[0] : "127.0.0.1";
+            string username = args.Length > 1 ? args[1] : string.Empty;
+            int port = 3389;
+            if (args.Length > 2)
+            {
+                int.TryParse(args[2], out port);
+            }
+
+            string seatLabel = args.Length > 3 ? args[3] : username;
+            if (string.IsNullOrWhiteSpace(seatLabel))
+            {
+                seatLabel = server;
+            }
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            using (var form = new Form())
+            {
+                form.Text = "neo_multiseat — " + seatLabel;
+                form.StartPosition = FormStartPosition.CenterScreen;
+                form.BackColor = Color.Black;
+                form.WindowState = FormWindowState.Maximized;
+
+                var banner = new Label
+                {
+                    Dock = DockStyle.Top,
+                    ForeColor = Color.White,
+                    BackColor = Color.FromArgb(32, 32, 32),
+                    Padding = new Padding(12, 10, 12, 10),
+                    AutoSize = false,
+                    Height = 48,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Text = "Connecting to " + server + "…"
+                };
+
+                var status = new Label
+                {
+                    Dock = DockStyle.Bottom,
+                    ForeColor = Color.LightGray,
+                    BackColor = Color.FromArgb(32, 32, 32),
+                    Padding = new Padding(12, 6, 12, 6),
+                    AutoSize = false,
+                    Height = 28,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Text = "CTRL+ALT+M toggles relative mouse inside the session"
+                };
+
+                var rdp = new RdpClientHost { Dock = DockStyle.Fill };
+
+                form.Controls.Add(rdp);
+                form.Controls.Add(status);
+                form.Controls.Add(banner);
+
+                form.Shown += (sender, e) =>
+                {
+                    try
+                    {
+                        dynamic ocx = rdp.GetOcx();
+                        RdpClientTweaks.ApplySessionSettings(ocx, server, username, port);
+                        banner.Text = "Connecting as " + (string.IsNullOrEmpty(username) ? "(prompt for credentials)" : username);
+                        status.Text = "Relative mouse forced on; use CTRL+ALT+M to toggle if needed.";
+                        ocx.Connect();
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(form, ex.Message, "neo_multiseat", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        form.BeginInvoke(new Action(() => form.Close()));
+                    }
+                };
+
+                Application.Run(form);
+            }
+        }
+    }
+}
+'@
+}
+
+function Test-NeoClientCurrent {
+  $path = Get-NeoClientPath
+  if (-not (Test-Path $path)) { return $false }
+  try {
+    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+    return ($info.FileVersion -eq (Get-NeoClientVersion))
+  } catch {
+    return $false
+  }
+}
+
+function Ensure-NeoClientExecutable {
+  $path = Get-NeoClientPath
+  if (Test-NeoClientCurrent) { return $path }
+
+  Write-Host "Building neo_rdp_client.exe (relative mouse launcher)..." -ForegroundColor Cyan
+
+  try {
+    [void][System.Reflection.Assembly]::LoadWithPartialName('Microsoft.CSharp')
+
+    $source = Get-NeoClientSource
+    $references = @(
+      'System.dll',
+      'System.Core.dll',
+      'System.Drawing.dll',
+      'System.Windows.Forms.dll',
+      'Microsoft.CSharp.dll'
+    )
+
+    $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $parameters = New-Object System.CodeDom.Compiler.CompilerParameters($references, $path, $false)
+    $parameters.GenerateExecutable = $true
+    $parameters.GenerateInMemory = $false
+    $parameters.CompilerOptions = '/target:winexe /platform:anycpu /optimize'
+
+    $results = $provider.CompileAssemblyFromSource($parameters, $source)
+
+    if ($results.Errors.Count -gt 0) {
+      foreach ($err in $results.Errors) {
+        Write-Warning ("  " + $err.ToString())
+      }
+      throw "Compilation failed"
+    }
+
+    Write-Host "neo_rdp_client.exe ready at $path" -ForegroundColor Green
+    return $path
+  } catch {
+    Write-Warning "Unable to build neo_rdp_client.exe automatically: $($_.Exception.Message)"
+    return $null
+  }
+}
+
 function New-NeoRdpFile {
   param([Parameter(Mandatory=$true)][string]$TargetUser)
   $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
          Where-Object { $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '127.0.0.1' } |
          Select-Object -ExpandProperty IPAddress
   $primary = if ($ips) { $ips | Select-Object -First 1 } else { $env:COMPUTERNAME }
+  $port = Get-RdpPort
 
   $rdpLines = @(
     ("full address:s:{0}" -f $primary),
+    ("server port:i:{0}" -f $port),
     ("username:s:{0}" -f $TargetUser),
     "prompt for credentials:i:1",
     "screen mode id:i:2",
+    "promptcredentialonce:i:1",
     "authentication level:i:2",
-    "compression:i:1"
+    "compression:i:1",
+    "drivestoredirect:s:"
   )
   $content = ($rdpLines -join "`r`n") + "`r`n"
 
-  $fileName = "$TargetUser.rdp"
-  $outScript = Join-Path $PSScriptRoot $fileName
-  $outPublic = Join-Path $env:Public ("Desktop\" + $fileName)
+  $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+  $safeUserChars = $TargetUser.ToCharArray() | ForEach-Object {
+    if ($invalid -contains $_) { '_' } else { $_ }
+  }
+  $safeUser = -join $safeUserChars
+  if (-not $safeUser) { $safeUser = 'user' }
+  $baseName = "Seat2_{0}_{1}" -f $safeUser, $timestamp
 
+  $rdpName = "$baseName.rdp"
+  $outScript = Join-Path $PSScriptRoot $rdpName
+  $outPublic = Join-Path $env:Public ("Desktop\" + $rdpName)
+
+  $ascii = [System.Text.Encoding]::ASCII
+  $written = @()
   try {
-    $ascii = [System.Text.Encoding]::ASCII
     [System.IO.File]::WriteAllText($outScript, $content, $ascii)
-    [System.IO.File]::WriteAllText($outPublic, $content, $ascii)
-    Write-Host "Created RDP file(s):" -ForegroundColor Green
-    Write-Host "  $outScript"
-    Write-Host "  $outPublic"
+    $written += $outScript
   } catch {
-    Write-Warning "Could not write .RDP file(s): $($_.Exception.Message)"
+    Write-Warning "Could not write $outScript: $($_.Exception.Message)"
+  }
+  try {
+    [System.IO.File]::WriteAllText($outPublic, $content, $ascii)
+    $written += $outPublic
+  } catch {
+    Write-Warning "Could not write $outPublic: $($_.Exception.Message)"
+  }
+
+  if ($written.Count -gt 0) {
+    Write-Host "Created RDP file(s):" -ForegroundColor Green
+    foreach ($p in $written) { Write-Host "  $p" }
+  }
+
+  $clientExe = Ensure-NeoClientExecutable
+  if ($clientExe) {
+    $launcherName = "$baseName (neo client).lnk"
+    $launcherScript = Join-Path $PSScriptRoot $launcherName
+    $launcherPublic = Join-Path $env:Public ("Desktop\" + $launcherName)
+
+    $quoteArg = {
+      param([string]$value)
+      if ($null -eq $value) { return '""' }
+      if ($value -match '[\s\"]') {
+        return '"' + ($value -replace '"','\\"') + '"'
+      }
+      return $value
+    }
+    $argList = @(
+      & $quoteArg $primary
+      & $quoteArg $TargetUser
+      & $quoteArg ([string]$port)
+      & $quoteArg $baseName
+    )
+    $clientArgs = ($argList -join ' ')
+
+    $launchers = @()
+    if (New-NeoShortcut -ShortcutPath $launcherScript -TargetPath $clientExe -Arguments $clientArgs -WorkingDirectory $PSScriptRoot) {
+      $launchers += $launcherScript
+    }
+    if (New-NeoShortcut -ShortcutPath $launcherPublic -TargetPath $clientExe -Arguments $clientArgs -WorkingDirectory $PSScriptRoot) {
+      $launchers += $launcherPublic
+    }
+
+    if ($launchers.Count -gt 0) {
+      Write-Host "Created neo client launcher(s):" -ForegroundColor Green
+      foreach ($l in $launchers) { Write-Host "  $l" }
+    }
+  } else {
+    Write-Warning "neo_rdp_client.exe launcher unavailable. Skipped creating neo client shortcut."
   }
 }
 
@@ -595,10 +972,45 @@ function Open-RDP-Folder {
 }
 
 # --- RDP setup ---------------------------------------------------------
+function Set-NeoRdpGraphicsMode {
+  param([switch]$Quiet)
+
+  $policyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+  if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
+
+  $policyValues = @{
+    UseHardwareGraphicsAdapters   = 1
+    UseWddmGraphicsDisplayDriver  = 1
+  }
+  foreach ($entry in $policyValues.GetEnumerator()) {
+    New-ItemProperty -Path $policyKey -Name $entry.Key -PropertyType DWord -Value $entry.Value -Force | Out-Null
+  }
+
+  $rdpValues = @{
+    fEnableWddmDriver             = 1
+    UseWddmGraphicsDisplayDriver  = 1
+    UseHardwareMode               = 1
+    DisableCursorSetting          = 0
+    fDisableCursorSuppression     = 0
+    DisableHWInput                = 0
+  }
+  foreach ($entry in $rdpValues.GetEnumerator()) {
+    try {
+      New-ItemProperty -Path $RdpKey -Name $entry.Key -PropertyType DWord -Value $entry.Value -Force | Out-Null
+    } catch {}
+  }
+
+  if (-not $Quiet) {
+    Write-Host 'Remote Desktop now forces GPU/WDDM mode so fullscreen games keep the mouse locked per seat.' -ForegroundColor Cyan
+    Write-Host 'Tip: once connected, press CTRL+ALT+M to toggle relative mouse mode if a game still hits the window edge.' -ForegroundColor Cyan
+  }
+}
+
 function Enable-RDP-And-Firewall {
   $preview = @(
     "Registry flip: Enable RDP connections",
     "Policy keys: allow multiple sessions / raise instance cap",
+    "Graphics: force WDDM/GPU mode so fullscreen games keep mouse capture",
     "Firewall: disable Windows 'Remote Desktop' group; use neo rules",
     "Firewall: enable neo_multiseat LAN rule by default (LocalSubnet)"
   )
@@ -608,6 +1020,11 @@ function Enable-RDP-And-Firewall {
     'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f',
     'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f',
     'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxInstanceCount /t REG_DWORD /d 999999 /f',
+    'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v UseHardwareGraphicsAdapters /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v UseWddmGraphicsDisplayDriver /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fEnableWddmDriver /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UseWddmGraphicsDisplayDriver /t REG_DWORD /d 1 /f',
+    'reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v UseHardwareMode /t REG_DWORD /d 1 /f',
     'netsh advfirewall firewall set rule group="remote desktop" new enable=no'
   )
   Confirm-Apply -Title "Enable RDP & policy keys" -PreviewLines $preview -ManualGui $gui -ManualCli $cli -Action {
@@ -615,6 +1032,7 @@ function Enable-RDP-And-Firewall {
     reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f | Out-Null
     reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f | Out-Null
     reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxInstanceCount /t REG_DWORD /d 999999 /f | Out-Null
+    Set-NeoRdpGraphicsMode -Quiet:$true
     # Always disable Windows built-in RDP group; we manage access via neo rules
     try { Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Out-Null }
     catch { netsh advfirewall firewall set rule group="remote desktop" new enable=no | Out-Null }
@@ -716,6 +1134,7 @@ function Fix-RDP-Service {
       Start-Service TermService
       Start-Service UmRdpService
       Get-Service TermService,UmRdpService,SessionEnv | Format-Table Name,Status,StartType -AutoSize
+      Set-NeoRdpGraphicsMode
     } catch {
       Write-Error $_.Exception.Message
       throw

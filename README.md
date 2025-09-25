@@ -18,10 +18,12 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
 - **One script, one job** — a clean menu that guides you end‑to‑end.
 - **Pick or create a user** — list existing accounts, reset a password, or add a new one.
 - **Always creates a `.rdp` file** — named after the chosen user *and* timestamp.
+- **Optional neo client launcher** — auto-builds a bundled RDP client and drops a `.lnk` that forces relative mouse mode.
 - **Supports more than two seats** — concurrent sessions for multiple users (people run 3–5 regularly; **10 can be done** on capable hardware/configs).
 - **Works with your fork** — downloads and updates from your repo for stability.
 - **Auto‑updates the good stuff** — fetches updated config after Windows updates.
 - **Built‑in “Fix it”** — if RDP gets grumpy, press Fix; the script repairs and retries.
+- **Locks the mouse for games** — forces GPU/WDDM mode so second+ seats don’t hit invisible screen borders when a game grabs the cursor (tap **CTRL+ALT+M** in-session to toggle relative mouse input if needed).
 - **Open the folder / delete a user** — quick maintenance shortcuts, right in the menu.
 - **Polite finish** — tells you when to reboot, doesn’t hold your PC hostage.
 
@@ -41,6 +43,8 @@ Sometimes you’ve got a solid PC and **two (or more) humans**. Pair programming
   - `neo_multiseat.net.json` — network modes config (auto‑created)
   - `neo_multiseat_*.log` — transcript logs per run
   - `*.rdp` — generated connection files (per user)
+  - `neo_rdp_client.exe` — auto-built WinForms launcher that flips relative mouse on
+  - `* (neo client).lnk` — one-click shortcuts that call the launcher with host/user/port args
 
 ---
 
@@ -87,17 +91,31 @@ When done, **reboot once** before testing the extra seats.
 ## How to connect (super explicit)
 
 - The script **always** creates a ready‑to‑use `.rdp` file when you pick or create a user.
-- File name format:  
+- File name format:
   `Seat2_<username>_<YYYYMMDD_HHMMSS>.rdp`
+- Optional launcher:
+  `Seat2_<username>_<YYYYMMDD_HHMMSS> (neo client).lnk`
 - Where to find it:
   - In the **same folder** as the script
   - On the **Public Desktop** (so it’s easy for everyone)
 - To connect:
-  1. Double‑click the `.rdp` file.
+  1. Double‑click the `.rdp` file **or** the `(neo client)` shortcut (it launches the bundled client and forces relative mouse).
   2. When prompted, enter the password you set in the script for that user.
   3. If you see any warning, read it (responsibly), then continue.
 
 > Tip: You can copy the `.rdp` file to another machine and connect across the network (make sure PCs can see each other and ports/firewall are open).
+
+---
+
+## neo_multiseat client (auto-built)
+
+Want relative mouse capture without pressing **CTRL+ALT+M** each session? The script now compiles a tiny WinForms launcher (`neo_rdp_client.exe`) on demand whenever you generate a seat:
+
+1. Run **Install / Configure extra seats** like normal. When you pick a user, the script checks whether `neo_rdp_client.exe` is present and up to date.
+2. If it’s missing or outdated, PowerShell compiles the built-in C# source (no Visual Studio required) and drops the exe next to the script.
+3. Alongside the `.rdp`, you’ll also get `Seat2_<username>_<timestamp> (neo client).lnk`. That shortcut launches the bundled client with host, username, and port arguments pre-filled, flips Microsoft’s hidden `AllowRelativeMouseMode`/`RelativeMouseMode` switches before connect, and jumps straight into the session with true relative mouse capture.
+
+> Tip: If you prefer to ship a custom-signed build, replace `neo_rdp_client.exe` after running the script once—the timestamped `(neo client)` shortcuts pick it up automatically.
 
 ---
 
@@ -140,6 +158,8 @@ When done, **reboot once** before testing the extra seats.
 
 - **"TermService failed to start"**  
   Choose **Fix RDP** in the menu (or accept the "Fix now?" prompt). It will repair things and retry.
+- **"Mouse won’t turn all the way" inside a fullscreen game**
+  Re-run **Install / Configure** so the GPU/WDDM + cursor policy fix reapplies (it keeps each seat’s mouse locked to the entire display). Once you reconnect, press **CTRL+ALT+M** to enable relative mouse mode — that hotkey is per-session and helps when a game still bumps into the edges. If you ran **Fix RDP**, run **Install / Configure** once more to lay the mouse fix back down. For hands-off capture, use the generated `(neo client)` shortcut — it launches the bundled client, flips Microsoft’s hidden switches automatically, and keeps the cursor locked for games.
 - **RDPConf shows red**  
   Run **Fix RDP**, then **Install** again. The script auto‑updates what it needs.
 - **AV blocked something**  
