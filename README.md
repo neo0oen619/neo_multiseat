@@ -1,3 +1,11 @@
+Looking for a simple 2‑player setup?
+
+If you only need two players and want the best input quality without paying, use Duo: https://github.com/DuoStream/Duo
+
+neo_multiseat supports more than two users, but it runs over RDP, which can cause buggy mouse/input in some games. A native, low‑latency path is WIP (complex and not ready yet).
+
+Note: Duo is free for two users; more than two requires a paid plan.
+
 # neo_multiseat 🎮🖥️🖥️🖥️
 
 Turn one Windows PC into a comfy **multi‑seat** workstation — without weird hacks or yak‑shaving.
