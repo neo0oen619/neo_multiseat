@@ -4,7 +4,7 @@ If you only need two players and want the best input quality without paying, use
 
 neo_multiseat supports more than two users, but it runs over RDP, which can cause buggy mouse/input in some games. A native, low‑latency path is WIP (complex and not ready yet).
 
-Note: Duo is free for two users; more than two requires a paid plan.
+Note: Duo is free for two users; more than two requires a paid plan. of 10$ for lifetime 
 
 # neo_multiseat 🎮🖥️🖥️🖥️
 
